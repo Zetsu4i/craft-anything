@@ -113,7 +113,7 @@ pub fn ensure_bridge() {
     if !z_ai_config_present() {
         return;
     }
-    let holder = BRIDGE.get_or_init(|| Arc::default());
+    let holder = BRIDGE.get_or_init(Arc::default);
     let mut g = holder.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if g.is_some() {
         return;
@@ -125,7 +125,7 @@ pub fn ensure_bridge() {
         .timeout_global(Some(Duration::from_secs(2)))
         .build()
         .new_agent();
-    if agent.get(format!("http://127.0.0.1:{BRIDGE_PORT}/health")).call().is_ok_and(|mut r| r.status().as_u16() / 100 == 2) {
+    if agent.get(format!("http://127.0.0.1:{BRIDGE_PORT}/health")).call().is_ok_and(|r| r.status().as_u16() / 100 == 2) {
         return;
     }
     let Some(dir) = assets() else { return };
