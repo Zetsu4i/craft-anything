@@ -16,3 +16,10 @@ corpus/
 *.pfx
 *.key
 .claude/settings.local.json
+
+# The bundled ZCode agent's runtime pieces are fetched at build time (see resources/zcode/README.md);
+# the bridge and the provider catalogue are committed.
+/resources/zcode/zcode.cjs
+/resources/zcode/node/
+/resources/zcode/resources/
+/resources/sandbox/

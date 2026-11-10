@@ -25,6 +25,14 @@ static FILE_LOCK: Mutex<()> = Mutex::new(());
 /// Where the fal.ai key for generated game assets is stored.
 pub const FAL_KEY: &str = "assets:fal";
 
+/// Where the cloud sandbox provider's key is stored (Settings → AI → Sandbox).
+pub const SANDBOX_KEY: &str = "sandbox:e2b";
+
+/// The sandbox's key: stored, else `E2B_API_KEY`.
+pub fn sandbox_key(store: &KeyStore) -> Option<String> {
+    store.get(SANDBOX_KEY).or_else(|| std::env::var("E2B_API_KEY").ok()).map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+}
+
 /// Where an asset provider's key is stored (`assets:<provider id>`).
 pub fn asset_key_name(provider: &str) -> String {
     format!("assets:{provider}")

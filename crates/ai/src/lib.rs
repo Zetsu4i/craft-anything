@@ -26,6 +26,7 @@ pub mod price;
 pub mod prompt;
 pub mod providers;
 pub mod rebuild;
+pub mod sandbox;
 pub mod ssh;
 
 pub use cli_agents::models::{AgentModel, ModelContext};
@@ -86,7 +87,7 @@ impl BackendKind {
             BackendKind::Gemini => openai::GEMINI_MODELS,
             BackendKind::OpenaiCompatible => &[],
             BackendKind::AgentCli => {
-                &["claude-code", "codex", "copilot", "grok", "gemini-cli", "opencode", "antigravity", "hermes", "maki", "aider", "dsh", "devin"]
+                &["claude-code", "zcode", "codex", "copilot", "grok", "gemini-cli", "opencode", "antigravity", "hermes", "maki", "aider", "dsh", "devin"]
             }
         }
     }
@@ -880,18 +881,30 @@ impl AiHub {
 
     /// Which backends have a key saved in the app, rather than only in the environment. The
     /// keychain can be slow, so the app reads this on a worker.
+    /// Which backends keep their key in the app: the API kinds, and ZCode (its GLM provider is
+    /// this person's own). An agent CLI otherwise keeps its own sign-in.
+    fn takes_key(config: &BackendConfig) -> bool {
+        config.kind != BackendKind::AgentCli || config.model == crate::cli_agents::zcode::AGENT_ID
+    }
+
     pub fn stored_backend_keys(&self) -> std::collections::BTreeMap<String, bool> {
-        self.config()
+        let mut keys: std::collections::BTreeMap<String, bool> = self
+            .config()
             .backends
             .iter()
-            .filter(|b| b.config.kind != BackendKind::AgentCli)
+            .filter(|b| Self::takes_key(&b.config))
             .map(|b| (b.config.name.clone(), self.keys.get(&b.config.name).is_some()))
-            .collect()
+            .collect();
+        keys.insert(keys::SANDBOX_KEY.to_string(), keys::sandbox_key(&self.keys).is_some());
+        keys
     }
 
     /// Whether an API backend has a key saved in the app (not the environment); never the key.
     pub fn saved_backend_key(&self, name: &str) -> Result<bool, ToolError> {
-        if self.entry(name)?.config.kind == BackendKind::AgentCli {
+        if name == keys::SANDBOX_KEY {
+            return Ok(keys::sandbox_key(&self.keys).is_some());
+        }
+        if !Self::takes_key(&self.entry(name)?.config) {
             return Err(ToolError::invalid("A coding agent keeps its own sign-in; there is no saved key to report here."));
         }
         Ok(self.keys.get(name).is_some())
@@ -902,7 +915,7 @@ impl AiHub {
     pub fn set_backend_key(&self, name: &str, key: &str) -> Result<(), ToolError> {
         let edit = self.backend_edits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         edit.label("Backend key or removal");
-        if self.entry(name)?.config.kind == BackendKind::AgentCli {
+        if name != keys::SANDBOX_KEY && !Self::takes_key(&self.entry(name)?.config) {
             return Err(ToolError::invalid("A coding agent keeps its own sign-in; there is no key to save for it here."));
         }
         let key = key.trim();
@@ -925,10 +938,70 @@ impl AiHub {
     pub fn remove_backend_key(&self, name: &str) -> Result<(), ToolError> {
         let edit = self.backend_edits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         edit.label("Backend key or removal");
-        if self.entry(name)?.config.kind == BackendKind::AgentCli {
+        if name != keys::SANDBOX_KEY && !Self::takes_key(&self.entry(name)?.config) {
             return Err(ToolError::invalid("A coding agent keeps its own sign-in; there is no saved key to forget here."));
         }
         self.keys.delete(name)
+    }
+
+    /// Whether the cloud sandbox has a key saved (Settings → AI → Sandbox shows it).
+    pub fn has_sandbox_key(&self) -> bool {
+        keys::sandbox_key(&self.keys).is_some()
+    }
+
+    /// Save the cloud sandbox provider's key. The same read-back check an API backend's key gets.
+    pub fn set_sandbox_key(&self, key: &str) -> Result<(), ToolError> {
+        let edit = self.backend_edits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        edit.label("Sandbox key");
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(ToolError::invalid("The key is empty."));
+        }
+        self.keys.set(keys::SANDBOX_KEY, key)?;
+        if self.keys.get(keys::SANDBOX_KEY).as_deref() != Some(key) {
+            return Err(ToolError::new(ErrorCode::NoPermission, "The new sandbox key wasn't used: the system keychain still has an older one."))
+                .map_err(|e| e.with_remediation("Unlock the keychain, then save the key again."));
+        }
+        Ok(())
+    }
+
+    /// Forget the sandbox provider's key, so `E2B_API_KEY` (if set) is used again.
+    pub fn remove_sandbox_key(&self) -> Result<(), ToolError> {
+        let edit = self.backend_edits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        edit.label("Sandbox key");
+        self.keys.delete(keys::SANDBOX_KEY)
+    }
+
+    /// Try the sandbox provider with the key that's set, without starting anything: the settings
+    /// panel's "Test".
+    pub fn test_sandbox(&self, cfg: &crate::sandbox::SandboxConfig) -> Result<String, ToolError> {
+        let key = keys::sandbox_key(&self.keys).ok_or_else(|| {
+            ToolError::new(ErrorCode::NoPermission, "There is no E2B API key saved yet.")
+                .with_remediation("Save it in Settings → AI → Sandbox, or set E2B_API_KEY in the environment.")
+        })?;
+        let client = craft_anything_engines::e2b::E2B::new(key, &cfg.domain);
+        client.check_key()?;
+        let running = client.running_count().unwrap_or(0);
+        Ok(format!("The key works. {running} running sandbox{} right now.", if running == 1 { "" } else { "es" }))
+    }
+
+    /// Replace the sandbox settings (`[ai.sandbox]`), keeping everything else.
+    pub fn set_sandbox_config(&self, cfg: crate::sandbox::SandboxConfig) -> Result<(), ToolError> {
+        let edit = self.backend_edits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        edit.label("Sandbox settings");
+        let mut c = self.config();
+        c.sandbox = cfg;
+        self.save_config(&c)
+    }
+
+    /// Whether a backend builds in the sandbox: `None` follows the sandbox settings.
+    pub fn set_backend_sandbox(&self, name: &str, mode: Option<bool>) -> Result<(), ToolError> {
+        let edit = self.backend_edits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        edit.label("Where an AI builds");
+        let mut c = self.config();
+        let Some(e) = c.backends.iter_mut().find(|e| e.config.name == name) else { return Ok(()) };
+        e.options.sandbox = mode;
+        self.save_config(&c)
     }
 
     /// This installation's OpenCode Go session id. A backend added before one was made, or found

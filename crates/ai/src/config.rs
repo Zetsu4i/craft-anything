@@ -126,6 +126,10 @@ pub struct BackendOptions {
     /// another account. `~/` is the home folder; over SSH it's a folder on that computer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_dir: Option<String>,
+    /// This backend builds in the project's cloud sandbox instead of this computer's folders
+    /// (`false` or `true`); unset follows the sandbox settings (`[ai.sandbox] enabled`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<bool>,
 }
 
 impl BackendOptions {
@@ -207,6 +211,14 @@ pub struct BackendEntry {
     pub options: BackendOptions,
 }
 
+impl BackendOptions {
+    /// Whether this backend's runs happen in the project's cloud sandbox: `false`/`true` say so
+    /// outright; `None` follows the sandbox settings (`[ai.sandbox] enabled`).
+    pub fn wants_sandbox(&self, enabled: bool) -> bool {
+        self.sandbox.unwrap_or(enabled)
+    }
+}
+
 impl BackendEntry {
     /// Older configurations can put OpenCode's variant directly in its model reference.
     fn thinking_from_model(&mut self) {
@@ -268,6 +280,9 @@ pub struct AiConfig {
     /// prompt caching survives restarts (and tests stay inside their own settings file).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_id: Option<String>,
+    /// Builds in a cloud sandbox instead of this computer's folders (`[ai.sandbox]`).
+    #[serde(default, skip_serializing_if = "crate::sandbox::SandboxConfig::is_default")]
+    pub sandbox: crate::sandbox::SandboxConfig,
 }
 
 pub fn role_key(r: Role) -> &'static str {

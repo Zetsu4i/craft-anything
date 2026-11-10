@@ -332,6 +332,33 @@ impl CraftApp {
         });
     }
 
+    /// Replace the cloud sandbox's settings (Settings → AI → Sandbox).
+    pub fn set_sandbox(&mut self, cfg: craft_anything_ai::sandbox::SandboxConfig) {
+        let hub = self.hub.clone();
+        self.jobs.spawn(tr("Change the sandbox settings"), false, move |_| {
+            hub.set_sandbox_config(cfg).map_err(|e| e.message)?;
+            Ok(crate::backends(&hub))
+        });
+    }
+
+    /// Say whether one AI builds in the cloud sandbox (`None`: follow the sandbox settings).
+    pub fn set_backend_sandbox(&mut self, name: &str, mode: Option<bool>) {
+        let (hub, name) = (self.hub.clone(), name.to_string());
+        self.jobs.spawn(tr("Set where an AI builds"), false, move |_| {
+            hub.set_backend_sandbox(&name, mode).map_err(|e| e.message)?;
+            Ok(crate::backends(&hub))
+        });
+    }
+
+    /// Try the sandbox provider with the key that's saved, without starting anything.
+    pub fn test_sandbox(&mut self) {
+        let hub = self.hub.clone();
+        self.jobs.spawn(tr("Test the sandbox"), true, move |_| {
+            let cfg = hub.config().sandbox;
+            Ok(crate::Done::SandboxTest { result: hub.test_sandbox(&cfg).map_err(|e| e.message) })
+        });
+    }
+
     /// Remove an AI and its stored key.
     pub fn remove_backend(&mut self, name: &str) {
         let (hub, name) = (self.hub.clone(), name.to_string());

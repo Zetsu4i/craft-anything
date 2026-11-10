@@ -1,0 +1,125 @@
+# The Windows build: one portable package with the app, the CLI helper next to it, and the
+# bundled ZCode agent (its runtime and search tools are fetched at build time, so this
+# repository stays light — see resources/zcode/README.md). A Linux build of the CLI helper
+# comes along too, for the sandbox's tool server.
+#
+# The upstream release pipeline (WiX MSI, signing, every platform) lives in a private reusable
+# workflow this fork can't call; this one is self-contained and produces the Windows exe.
+
+name: Windows build
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_INCREMENTAL: 0
+  NODE_VERSION: 22.20.0
+  RG_VERSION: 14.1.1
+  UGREP_VERSION: v7.8.5
+
+jobs:
+  linux-cli:
+    name: Linux CLI helper (for the sandbox)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-cli-musl
+      - name: Build the CLI (static)
+        run: cargo build --release -p craft-anything-cli --target x86_64-unknown-linux-musl
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: craft-anything-cli-linux
+          path: target/x86_64-unknown-linux-musl/release/craft-anything-cli
+          if-no-files-found: error
+
+  windows:
+    name: Windows exe
+    runs-on: windows-latest
+    needs: linux-cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-exe
+
+      - name: Build the app and its CLI helper
+        run: cargo build --release -p craft-anything -p craft-anything-cli
+
+      - name: Fetch the ZCode agent
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path resources/zcode/node, resources/zcode/resources | Out-Null
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Zetsu4i/zcode-agent-core/main/extracted/zcode.cjs" -OutFile resources/zcode/zcode.cjs
+          $zcode = (Get-Item resources/zcode/zcode.cjs).Length
+          if ($zcode -lt 1000000) { throw "zcode.cjs looks wrong ($zcode bytes)" }
+          Write-Host "zcode.cjs: $zcode bytes"
+
+      - name: Fetch the Node 22 runtime
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP/node.zip"
+          Invoke-WebRequest -Uri "https://nodejs.org/dist/v${env:NODE_VERSION}/node-v${env:NODE_VERSION}-win-x64.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP/node" -Force
+          Copy-Item "$env:RUNNER_TEMP/node/node-v${env:NODE_VERSION}-win-x64/node.exe" resources/zcode/node/node.exe
+          & resources/zcode/node/node.exe --version
+
+      - name: Fetch the agent's search tools
+        shell: pwsh
+        run: |
+          $rg = "$env:RUNNER_TEMP/rg.zip"
+          Invoke-WebRequest -Uri "https://github.com/BurntSushi/ripgrep/releases/download/${env:RG_VERSION}/ripgrep-${env:RG_VERSION}-x86_64-pc-windows-msvc.zip" -OutFile $rg
+          Expand-Archive -Path $rg -DestinationPath "$env:RUNNER_TEMP/rg" -Force
+          Copy-Item "$env:RUNNER_TEMP/rg/ripgrep-${env:RG_VERSION}-x86_64-pc-windows-msvc/rg.exe" resources/zcode/resources/rg.exe
+          $ug = "$env:RUNNER_TEMP/ugrep.zip"
+          Invoke-WebRequest -Uri "https://github.com/Genivia/ugrep/releases/download/${env:UGREP_VERSION}/ugrep-windows-x64.zip" -OutFile $ug
+          Expand-Archive -Path $ug -DestinationPath "$env:RUNNER_TEMP/ugrep" -Force
+          Copy-Item "$env:RUNNER_TEMP/ugrep/ugrep-windows-x64/ugrep.exe" resources/zcode/resources/ugrep.exe -ErrorAction SilentlyContinue
+          Get-ChildItem resources/zcode -Recurse -File | ForEach-Object { Write-Host "$($_.Length)`t$($_.FullName)" }
+
+      - name: Take the sandbox's Linux CLI
+        uses: actions/download-artifact@v4
+        with:
+          name: craft-anything-cli-linux
+          path: resources/sandbox
+
+      - name: Package the portable app
+        shell: pwsh
+        run: |
+          $stage = "$env:RUNNER_TEMP/craft-anything"
+          New-Item -ItemType Directory -Force -Path "$stage/resources" | Out-Null
+          Copy-Item target/release/craft-anything.exe $stage/
+          Copy-Item target/release/craft-anything-cli.exe $stage/
+          Copy-Item resources/zcode $stage/resources/zcode -Recurse
+          Copy-Item resources/sandbox/craft-anything-cli-linux $stage/resources/sandbox/craft-anything-cli-linux -Force
+          $zip = "$env:RUNNER_TEMP/craft-anything-windows-x64.zip"
+          if (Test-Path $zip) { Remove-Item $zip }
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip
+          Move-Item $zip craft-anything-windows-x64.zip
+          Get-Item craft-anything-windows-x64.zip | ForEach-Object { Write-Host "package: $($_.Length) bytes" }
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: craft-anything-windows-x64
+          path: craft-anything-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: craft-anything-windows-x64.zip

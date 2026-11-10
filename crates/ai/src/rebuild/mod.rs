@@ -757,7 +757,7 @@ impl Worker {
             (!session.clean_room(), session.config_dir(), session.shared_targets())
         };
         refuse_deep_session_reuse_in_clean_room(ws, &entry.config.model, &entry.options.args, deep)?;
-        Ok(CliSpec {
+        let mut spec = CliSpec {
             builder: Some(Builder { investigation: Some(ws.investigation_dir()), inbox: ws.inbox_dir() }),
             deep,
             targets,
@@ -773,7 +773,25 @@ impl Worker {
             ),
             adapters: opts.adapters.clone(),
             ..CliSpec::new(entry.config.clone(), entry.options.clone(), opts.beginner, Some(ws.root.clone()))
-        })
+        };
+        // A backend that builds in the project's cloud sandbox gets it here, so the run fails fast
+        // (with the way to fix it) instead of halfway through a turn.
+        let sandbox_cfg = {
+            let session = self.engine.session();
+            crate::config::AiConfig::from_settings(&session.settings).sandbox
+        };
+        if entry.options.wants_sandbox(sandbox_cfg.enabled) {
+            if !sandbox_cfg.supported() {
+                return Err(ToolError::new(craft_anything_evidence::ErrorCode::BadSettings, format!("Unknown sandbox provider {}.", sandbox_cfg.provider))
+                    .with_remediation("Set the sandbox provider to \"e2b\" in config.toml ([ai.sandbox])."));
+            }
+            let key = crate::keys::sandbox_key(&self.keys).ok_or_else(|| {
+                ToolError::new(craft_anything_evidence::ErrorCode::NoPermission, "Building in the sandbox needs an E2B API key, and there isn't one.")
+                    .with_remediation("Save it in Settings → AI → Sandbox, or set E2B_API_KEY in the environment.")
+            })?;
+            spec.sandbox = Some(crate::sandbox::Sandbox::open(sandbox_cfg, &key, &ws.root, |_| {})?);
+        }
+        Ok(spec)
     }
 
     /// The whole run: checks the builder can start, studies a new project, then builds and checks
