@@ -32,11 +32,43 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
-      - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install musl tools (retry + mirror fallback)
+        shell: bash
+        run: |
+          if command -v musl-gcc >/dev/null 2>&1; then
+            echo "musl-gcc already present; skipping apt install."
+            exit 0
+          fi
+
+          sudo tee /etc/apt/apt.conf.d/99-ci-retries >/dev/null <<'EOF'
+          Acquire::Retries "6";
+          Acquire::http::Timeout "30";
+          Acquire::https::Timeout "30";
+          Acquire::ForceIPv4 "true";
+          EOF
+
+          sudo apt-get update || true
+
+          for attempt in 1 2 3; do
+            if sudo apt-get install -y --no-install-recommends --fix-missing musl-tools; then
+              command -v musl-gcc >/dev/null 2>&1
+              exit 0
+            fi
+            echo "musl-tools install attempt ${attempt} failed."
+            if [[ "${attempt}" == "1" && -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
+              echo "Switching ubuntu.sources away from apt mirrorlist to archive.ubuntu.com"
+              sudo sed -i 's|URIs: mirror+file:/etc/apt/apt-mirrors.txt|URIs: http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
+            fi
+            sleep $((attempt * 15))
+            sudo apt-get update || true
+          done
+
+          echo "Unable to install musl-tools after retries."
+          exit 1
       - uses: Swatinem/rust-cache@v2
         with:
           key: linux-cli-musl
+          cache-on-failure: true
       - name: Build the CLI (static)
         run: cargo build --release -p craft-anything-cli --target x86_64-unknown-linux-musl
       - name: Upload
@@ -56,6 +88,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows-exe
+          cache-on-failure: true
+      - name: Cache Windows packaging downloads
+        uses: actions/cache@v4
+        with:
+          key: windows-packaging-${{ env.NODE_VERSION }}-${{ env.RG_VERSION }}-${{ env.UGREP_VERSION }}-${{ env.ZCODE_APP_CLI_VERSION }}
+          path: .cache/windows-build
 
       - name: Build the app and its CLI helper
         run: cargo build --release -p craft-anything -p craft-anything-cli
@@ -63,15 +101,21 @@ jobs:
       - name: Fetch the ZCode agent
         shell: pwsh
         run: |
+          $cache = ".cache/windows-build"
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
           New-Item -ItemType Directory -Force -Path resources/zcode/node, resources/zcode/resources | Out-Null
-          $meta = Invoke-RestMethod -Uri "https://registry.npmjs.org/zcode-app-cli/$env:ZCODE_APP_CLI_VERSION"
-          $tgz = "$env:RUNNER_TEMP/zcode-app-cli.tgz"
-          $extract = "$env:RUNNER_TEMP/zcode-app-cli"
-          if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path $extract | Out-Null
-          Invoke-WebRequest -Uri $meta.dist.tarball -OutFile $tgz
-          tar -xzf $tgz -C $extract
-          Copy-Item "$extract/package/vendor/zcode.cjs" resources/zcode/zcode.cjs
+          $cachedZcode = "$cache/zcode-$env:ZCODE_APP_CLI_VERSION.cjs"
+          if (-not (Test-Path $cachedZcode)) {
+            $meta = Invoke-RestMethod -Uri "https://registry.npmjs.org/zcode-app-cli/$env:ZCODE_APP_CLI_VERSION"
+            $tgz = "$env:RUNNER_TEMP/zcode-app-cli.tgz"
+            $extract = "$env:RUNNER_TEMP/zcode-app-cli"
+            if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
+            New-Item -ItemType Directory -Force -Path $extract | Out-Null
+            Invoke-WebRequest -Uri $meta.dist.tarball -OutFile $tgz
+            tar -xzf $tgz -C $extract
+            Copy-Item "$extract/package/vendor/zcode.cjs" $cachedZcode -Force
+          }
+          Copy-Item $cachedZcode resources/zcode/zcode.cjs -Force
           $zcode = (Get-Item resources/zcode/zcode.cjs).Length
           if ($zcode -lt 1000000) { throw "zcode.cjs looks wrong ($zcode bytes)" }
           Write-Host "zcode.cjs: $zcode bytes"
@@ -79,23 +123,35 @@ jobs:
       - name: Fetch the Node 22 runtime
         shell: pwsh
         run: |
-          $zip = "$env:RUNNER_TEMP/node.zip"
-          Invoke-WebRequest -Uri "https://nodejs.org/dist/v${env:NODE_VERSION}/node-v${env:NODE_VERSION}-win-x64.zip" -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP/node" -Force
-          Copy-Item "$env:RUNNER_TEMP/node/node-v${env:NODE_VERSION}-win-x64/node.exe" resources/zcode/node/node.exe
+          $cache = ".cache/windows-build"
+          $zip = "$cache/node-v${env:NODE_VERSION}-win-x64.zip"
+          $extract = "$cache/node-v${env:NODE_VERSION}-win-x64"
+          if (-not (Test-Path "$extract/node.exe")) {
+            Invoke-WebRequest -Uri "https://nodejs.org/dist/v${env:NODE_VERSION}/node-v${env:NODE_VERSION}-win-x64.zip" -OutFile $zip
+            Expand-Archive -Path $zip -DestinationPath $cache -Force
+          }
+          Copy-Item "$extract/node.exe" resources/zcode/node/node.exe -Force
           & resources/zcode/node/node.exe --version
 
       - name: Fetch the agent's search tools
         shell: pwsh
         run: |
-          $rg = "$env:RUNNER_TEMP/rg.zip"
-          Invoke-WebRequest -Uri "https://github.com/BurntSushi/ripgrep/releases/download/${env:RG_VERSION}/ripgrep-${env:RG_VERSION}-x86_64-pc-windows-msvc.zip" -OutFile $rg
-          Expand-Archive -Path $rg -DestinationPath "$env:RUNNER_TEMP/rg" -Force
-          Copy-Item "$env:RUNNER_TEMP/rg/ripgrep-${env:RG_VERSION}-x86_64-pc-windows-msvc/rg.exe" resources/zcode/resources/rg.exe
-          $ug = "$env:RUNNER_TEMP/ugrep.zip"
-          Invoke-WebRequest -Uri "https://github.com/Genivia/ugrep/releases/download/${env:UGREP_VERSION}/ugrep-windows-x64.zip" -OutFile $ug
-          Expand-Archive -Path $ug -DestinationPath "$env:RUNNER_TEMP/ugrep" -Force
-          Copy-Item "$env:RUNNER_TEMP/ugrep/ugrep-windows-x64/ugrep.exe" resources/zcode/resources/ugrep.exe -ErrorAction SilentlyContinue
+          $cache = ".cache/windows-build"
+          $rgZip = "$cache/ripgrep-${env:RG_VERSION}.zip"
+          $rgExtract = "$cache/ripgrep-${env:RG_VERSION}"
+          if (-not (Test-Path "$rgExtract/ripgrep-${env:RG_VERSION}-x86_64-pc-windows-msvc/rg.exe")) {
+            Invoke-WebRequest -Uri "https://github.com/BurntSushi/ripgrep/releases/download/${env:RG_VERSION}/ripgrep-${env:RG_VERSION}-x86_64-pc-windows-msvc.zip" -OutFile $rgZip
+            Expand-Archive -Path $rgZip -DestinationPath $rgExtract -Force
+          }
+          Copy-Item "$rgExtract/ripgrep-${env:RG_VERSION}-x86_64-pc-windows-msvc/rg.exe" resources/zcode/resources/rg.exe -Force
+
+          $ugZip = "$cache/ugrep-${env:UGREP_VERSION}.zip"
+          $ugExtract = "$cache/ugrep-${env:UGREP_VERSION}"
+          if (-not (Test-Path "$ugExtract/ugrep-windows-x64/ugrep.exe")) {
+            Invoke-WebRequest -Uri "https://github.com/Genivia/ugrep/releases/download/${env:UGREP_VERSION}/ugrep-windows-x64.zip" -OutFile $ugZip
+            Expand-Archive -Path $ugZip -DestinationPath $ugExtract -Force
+          }
+          Copy-Item "$ugExtract/ugrep-windows-x64/ugrep.exe" resources/zcode/resources/ugrep.exe -ErrorAction SilentlyContinue -Force
           Get-ChildItem resources/zcode -Recurse -File | ForEach-Object { Write-Host "$($_.Length)`t$($_.FullName)" }
 
       - name: Take the sandbox's Linux CLI
