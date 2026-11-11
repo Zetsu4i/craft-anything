@@ -71,11 +71,21 @@ jobs:
           cache-on-failure: true
       - name: Build the CLI (static)
         run: cargo build --release -p craft-anything-cli --target x86_64-unknown-linux-musl
+      # The artifact keeps its own file name: an upload-artifact zip holds the file path inside the
+      # given path, so uploading `.../release/craft-anything-cli` downloads back as
+      # `craft-anything-cli`, not `craft-anything-cli-linux` (the artifact *name* never becomes the
+      # file's name). Stage it under the name the app looks for — `<exe>/resources/sandbox/
+      # craft-anything-cli-linux` (crates/ai/src/sandbox.rs, `sandbox_cli_path`) — before uploading.
+      - name: Stage the CLI under the name the app looks for
+        run: |
+          mkdir -p resources/sandbox
+          cp target/x86_64-unknown-linux-musl/release/craft-anything-cli resources/sandbox/craft-anything-cli-linux
+          file resources/sandbox/craft-anything-cli-linux || true
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: craft-anything-cli-linux
-          path: target/x86_64-unknown-linux-musl/release/craft-anything-cli
+          path: resources/sandbox/craft-anything-cli-linux
           if-no-files-found: error
 
   windows:
@@ -145,34 +155,86 @@ jobs:
           }
           Copy-Item "$rgExtract/ripgrep-${env:RG_VERSION}-x86_64-pc-windows-msvc/rg.exe" resources/zcode/resources/rg.exe -Force
 
+          # The agent looks these up by name (rg.exe, ugrep.exe) in its resources folder, so a
+          # bundle missing one is a broken builder. ugrep's release zip also nests its exe in a
+          # folder whose name has changed between versions: find it rather than hard-coding it.
           $ugZip = "$cache/ugrep-${env:UGREP_VERSION}.zip"
           $ugExtract = "$cache/ugrep-${env:UGREP_VERSION}"
-          if (-not (Test-Path "$ugExtract/ugrep-windows-x64/ugrep.exe")) {
+          if (-not (Get-ChildItem $ugExtract -Recurse -Filter 'ugrep.exe' -ErrorAction SilentlyContinue)) {
             Invoke-WebRequest -Uri "https://github.com/Genivia/ugrep/releases/download/${env:UGREP_VERSION}/ugrep-windows-x64.zip" -OutFile $ugZip
             Expand-Archive -Path $ugZip -DestinationPath $ugExtract -Force
           }
-          Copy-Item "$ugExtract/ugrep-windows-x64/ugrep.exe" resources/zcode/resources/ugrep.exe -ErrorAction SilentlyContinue -Force
+          $ugrep = Get-ChildItem $ugExtract -Recurse -Filter 'ugrep.exe' | Select-Object -First 1
+          if (-not $ugrep) { throw "ugrep-windows-x64.zip (${env:UGREP_VERSION}) holds no ugrep.exe" }
+          Copy-Item $ugrep.FullName resources/zcode/resources/ugrep.exe -Force
+          foreach ($tool in 'rg.exe', 'ugrep.exe') {
+            $path = "resources/zcode/resources/$tool"
+            if (-not (Test-Path $path)) { throw "$path is missing after fetching the search tools" }
+          }
           Get-ChildItem resources/zcode -Recurse -File | ForEach-Object { Write-Host "$($_.Length)`t$($_.FullName)" }
 
+      # The artifact's name is not the file's name: upload-artifact zips the file under the path
+      # inside the uploaded folder, so this downloads back as `craft-anything-cli-linux` only
+      # because the Linux job stages it under that name. Downloading into its own folder keeps the
+      # next step's copy unambiguous, and the checks below name what went wrong if it ever isn't.
       - name: Take the sandbox's Linux CLI
         uses: actions/download-artifact@v4
         with:
           name: craft-anything-cli-linux
-          path: resources/sandbox
+          path: ${{ runner.temp }}/sandbox-cli
+
+      - name: Check the sandbox's Linux CLI
+        shell: pwsh
+        run: |
+          $dir = "$env:RUNNER_TEMP/sandbox-cli"
+          Get-ChildItem $dir -Recurse -File | ForEach-Object { Write-Host "$($_.Length)`t$($_.FullName)" }
+          $cli = Get-ChildItem $dir -Recurse -File -Filter 'craft-anything-cli*' | Select-Object -First 1
+          if (-not $cli) { throw "The craft-anything-cli-linux artifact holds no craft-anything-cli file" }
+          # An ELF x86-64 binary: it is uploaded to the Linux sandbox, so a Windows exe here would
+          # be a silently broken sandbox later on.
+          $fs = [System.IO.File]::OpenRead($cli.FullName)
+          try {
+            $magic = New-Object byte[] 5
+            $null = $fs.Read($magic, 0, 5)
+          } finally { $fs.Dispose() }
+          if ($magic[0] -ne 0x7F -or $magic[1] -ne 0x45 -or $magic[2] -ne 0x4C -or $magic[3] -ne 0x46) {
+            throw "$($cli.FullName) is not a Linux (ELF) binary"
+          }
+          if ($magic[4] -ne 2) { throw "$($cli.FullName) is ELF class $($magic[4]): expected 64-bit (2)" }
+          New-Item -ItemType Directory -Force -Path resources/sandbox | Out-Null
+          Copy-Item $cli.FullName resources/sandbox/craft-anything-cli-linux -Force
+          Write-Host "sandbox CLI: $($cli.Length) bytes"
 
       - name: Package the portable app
         shell: pwsh
         run: |
           $stage = "$env:RUNNER_TEMP/craft-anything"
-          New-Item -ItemType Directory -Force -Path "$stage/resources" | Out-Null
-          Copy-Item target/release/craft-anything.exe $stage/
-          Copy-Item target/release/craft-anything-cli.exe $stage/
-          Copy-Item resources/zcode $stage/resources/zcode -Recurse
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path "$stage/resources", "$stage/resources/sandbox" | Out-Null
+          foreach ($exe in 'craft-anything.exe', 'craft-anything-cli.exe') {
+            if (-not (Test-Path "target/release/$exe")) { throw "target/release/$exe is missing: the build above didn't produce it" }
+            Copy-Item "target/release/$exe" $stage/
+          }
+          # The whole folder (dotfiles included), so nothing the agent needs is left behind.
+          Copy-Item resources/zcode $stage/resources -Recurse
           Copy-Item resources/sandbox/craft-anything-cli-linux $stage/resources/sandbox/craft-anything-cli-linux -Force
+          # The app finds the CLI beside itself (resources/sandbox/), and the agent finds zcode.cjs,
+          # its node.exe and its search tools inside resources/zcode/ — check the package, not the
+          # checkout, so a layout mistake fails here rather than on someone's desktop.
+          $expected = @(
+            'resources/sandbox/craft-anything-cli-linux',
+            'resources/zcode/zcode.cjs',
+            'resources/zcode/node/node.exe',
+            'resources/zcode/resources/rg.exe',
+            'resources/zcode/resources/ugrep.exe'
+          )
+          foreach ($rel in $expected) {
+            if (-not (Test-Path (Join-Path $stage $rel))) { throw "the package is missing $rel" }
+          }
           $zip = "$env:RUNNER_TEMP/craft-anything-windows-x64.zip"
           if (Test-Path $zip) { Remove-Item $zip }
           Compress-Archive -Path "$stage/*" -DestinationPath $zip
-          Move-Item $zip craft-anything-windows-x64.zip
+          Move-Item $zip craft-anything-windows-x64.zip -Force
           Get-Item craft-anything-windows-x64.zip | ForEach-Object { Write-Host "package: $($_.Length) bytes" }
 
       - name: Upload the package

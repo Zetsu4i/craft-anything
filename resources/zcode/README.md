@@ -9,17 +9,24 @@ app-server protocol instead of a per-message CLI run.
 | `zai-bridge.cjs` | The local bridge behind "GLM (built-in)": serves `POST /llm/v1/chat/completions` from the machine's `.z-ai-config` (working folder → home → `/etc`). No dependencies. | yes |
 | `config/zcode-builtin.json` | The agent's provider catalogue; the app points `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` at it. | yes |
 | `zcode.cjs` | The agent itself (Node ≥ 22.5). ~15 MB, fetched at build time so this repository stays light. | no — see below |
-| `node/` | A Node 22 runtime for Windows, fetched at build time. | no — see below |
-| `resources/rg`, `resources/ugrep`, `resources/bfs` | The agent's search binaries, fetched at build time (per platform). | no — see below |
+| `node/node.exe` | A Node 22 runtime for Windows, fetched at build time. | no — see below |
+| `resources/rg.exe`, `resources/ugrep.exe` | The agent's search binaries for Windows, fetched at build time. | no — see below |
 
 ## Where the fetched pieces come from
 
 The build workflow (`.github/workflows/windows-build.yml`) fetches, in order:
 
-1. `zcode.cjs` from `Zetsu4i/zcode-agent-core` (branch `main`): `extracted/zcode.cjs` — overwrite
-   it by uploading a new version there; no change is needed on this side.
+1. `zcode.cjs` from the `zcode-app-cli` npm package (`vendor/zcode.cjs` in its tarball; the
+   version is the workflow's `ZCODE_APP_CLI_VERSION`). Bump that variable to move to a newer agent.
 2. `node-v22*-win-x64` from nodejs.org, extracted into `node/`.
-3. `rg` (ripgrep), `ugrep` and `bfs` Windows builds from their GitHub releases, into `resources/`.
+3. `rg.exe` (ripgrep) and `ugrep.exe` (ugrep) from their GitHub releases, into `resources/`.
+
+The agent finds each piece beside itself: the app starts `node/node.exe` with `zcode.cjs`, and the
+agent looks for `rg.exe` and `ugrep.exe` in `resources/`. A package missing any of them builds fine
+and then fails on someone's desktop, so the workflow checks the staged package before zipping it.
+
+`bfs` is not fetched: the agent does not use it on Windows, and the sandbox's Linux copies of these
+tools come from the agent's own downloads there.
 
 For a **local** development run, either build the workflow once and copy its artifact, or drop
 the files in by hand:
