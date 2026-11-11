@@ -2,12 +2,9 @@
 # packaging shell/PowerShell scripts, and the Linux desktop/AppStream/Flatpak metadata.
 name: Packaging lint
 
+# NOTE (fork): this workflow calls a reusable workflow in storytold/craft-common-actions,
+# which this fork cannot invoke. It stays here for future merges and runs only by hand.
 on:
-  push:
-    branches: [main, release]
-    paths: [".github/workflows/**", "packaging/**", "assets/app-icon/**"]
-  pull_request:
-    paths: [".github/workflows/**", "packaging/**", "assets/app-icon/**"]
   workflow_dispatch:
 
 permissions:

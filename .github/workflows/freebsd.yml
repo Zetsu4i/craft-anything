@@ -8,16 +8,9 @@ name: FreeBSD
 # The VM build takes one to several hours, so it runs nightly on main rather than on every push
 # or dependency change: a drifted dependency still shows up within a day. PRs that change the
 # FreeBSD packaging itself still run it.
+# NOTE (fork): this workflow calls a reusable workflow in storytold/craft-common-actions,
+# which this fork cannot invoke. It stays here for future merges and runs only by hand.
 on:
-  push:
-    branches: [release]
-  schedule:
-    - cron: "17 2 * * *"
-  pull_request:
-    paths:
-      - .github/workflows/freebsd.yml
-      - packaging/freebsd/**
-      - packaging/env.sh
   workflow_dispatch:
 
 concurrency:

@@ -14,6 +14,7 @@ mod grok;
 mod hermes;
 mod maki;
 mod opencode;
+use super::zcode::ZcodeAdapter;
 pub use aider::Aider;
 pub use antigravity::Antigravity;
 pub use copilot::Copilot;
@@ -294,6 +295,7 @@ impl AgentAdapters {
                 Arc::new(Grok),
                 Arc::new(DeepSeekHarness),
                 Arc::new(Devin),
+                Arc::new(ZcodeAdapter),
             ],
         }
     }

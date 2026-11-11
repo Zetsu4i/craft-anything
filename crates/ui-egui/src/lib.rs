@@ -242,6 +242,9 @@ pub enum Done {
     },
     /// A saved-key mutation finished: the refreshed status, the error to report (if any), and the
     /// key that was saved so a matching draft can be cleared.
+    SandboxTest {
+        result: Result<String, String>,
+    },
     BackendKeyResult {
         request: u64,
         name: String,
@@ -1610,6 +1613,10 @@ impl CraftApp {
                     self.backend_keys = Some(keys);
                 }
             }
+            Done::SandboxTest { result } => match result {
+                Ok(text) => self.toast(text, false),
+                Err(e) => self.toast(e, true),
+            },
             Done::BackendKeyResult { request, name, keys, error, saved_key, forgot } => {
                 self.backend_key_pending.remove(&name);
                 if forgot && error.is_none() {

@@ -343,6 +343,10 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
     let (mut tune_models, mut save_tuning) = (Vec::new(), None);
     // A saved API key being replaced or forgotten (the keychain work happens off this frame).
     let (mut save_key, mut forget_key) = (None, None);
+    // The cloud sandbox: settings changes, per-AI "where does it build", and the key test.
+    let mut sandbox_cfg: Option<craft_anything_ai::sandbox::SandboxConfig> = None;
+    let mut sandbox_mode: Option<(String, Option<bool>)> = None;
+    let mut sandbox_test = false;
     // The AI whose Remove was pressed once: asked again before its key is deleted.
     let confirm_id = egui::Id::new("remove-ai");
     let confirming: Option<String> = ui.data(|d| d.get_temp(confirm_id));
@@ -573,7 +577,9 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
             // here without removing the AI (#1358). Every API backend can need one; agent apps
             // sign in their own way. The field stays even when a key is saved, so a replacement
             // doesn't need Forget first.
-            if b.kind != BackendKind::AgentCli {
+            // API backends carry their key here; ZCode does too (its GLM provider is this
+            // person's own). An agent app otherwise keeps its own sign-in.
+            if b.kind != BackendKind::AgentCli || b.model == craft_anything_ai::cli_agents::zcode::AGENT_ID {
                 // A save or forget for this backend is still running: no later action may be
                 // submitted until it finishes, so workers can't overtake one another. Other
                 // backends keep their controls.
@@ -588,12 +594,13 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                     }
                     let key = key_drafts.entry(b.name.clone()).or_default();
                     ui.horizontal_wrapped(|ui| {
+                        let hint = if b.model == craft_anything_ai::cli_agents::zcode::AGENT_ID {
+                            tr("Z.ai API key (stored in your system keychain)")
+                        } else {
+                            tr("API key (stored in your system keychain)")
+                        };
                         let r = ui.add(
-                            egui::TextEdit::singleline(key)
-                                .password(true)
-                                .hint_text(tr("API key (stored in your system keychain)"))
-                                .desired_width(260.0)
-                                .frame(widgets::text_field_frame_compact(&t)),
+                            egui::TextEdit::singleline(key).password(true).hint_text(hint).desired_width(260.0).frame(widgets::text_field_frame_compact(&t)),
                         );
                         widgets::named(r, &trf("{name} key", &[("name", &b.name)]));
                         let k = key.trim().to_string();
@@ -643,6 +650,24 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                         }
                     });
                 }
+                // Where it builds: here (as the sandbox settings say), always in the project's
+                // cloud sandbox, or always on this computer.
+                if b.kind == BackendKind::AgentCli {
+                    let mode = app.backend_options.get(&b.name).and_then(|o| o.sandbox);
+                    let (label, tip) = match mode {
+                        None => ("Sandbox: as set below", "This AI builds wherever Settings → AI → Sandbox says."),
+                        Some(true) => ("Sandbox: always", "This AI always builds in the project's cloud sandbox."),
+                        Some(false) => ("Sandbox: never", "This AI always builds on this computer."),
+                    };
+                    if widgets::secondary(ui, Some("cloud"), label).on_hover_text(tr(tip)).clicked() {
+                        let next = match mode {
+                            None => Some(true),
+                            Some(true) => Some(false),
+                            Some(false) => None,
+                        };
+                        sandbox_mode = Some((b.name.clone(), next));
+                    }
+                }
                 // Off: kept with its key, but nothing uses it.
                 let (label, tip) = if b.enabled {
                     ("Turn off", "Nothing uses it until it's on again; it keeps its key.")
@@ -680,7 +705,128 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
         });
         ui.add_space(6.0);
     }
-    key_drafts.retain(|name, _| app.backends.iter().any(|backend| &backend.name == name));
+    // The cloud sandbox: where a project's builder runs when it's on, with the key that pays
+    // for it and how quickly unused sandboxes are put away.
+    ui.add_space(16.0);
+    widgets::caption(ui, "Cloud sandbox");
+    ui.add_space(4.0);
+    widgets::panel(&t).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let mut cfg = app.hub.config().sandbox;
+        let has_key = app.backend_keys.as_ref().and_then(|keys| keys.get(craft_anything_ai::keys::SANDBOX_KEY).copied()) == Some(true);
+        ui.horizontal(|ui| {
+            icons::show(ui, "cloud", 18.0, if cfg.enabled { t.accent } else { t.text_faint });
+            ui.vertical(|ui| {
+                ui.label(RichText::new(tr("Build in a cloud sandbox (E2B)")).font(theme::semibold(theme::SMALL)));
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(tr(
+                            "A builder works in its project's own Linux box in the cloud, with all of its tools, instead of on this computer. What it builds is copied back after every turn; an unused sandbox is paused and brought back when it's needed again.",
+                        ))
+                        .color(t.text_faint)
+                        .size(theme::CAPTION),
+                    )
+                    .wrap(),
+                );
+            });
+        });
+        ui.add_space(6.0);
+        row(ui, "Sandbox", "Off: builders work on this computer, as always.", |ui| {
+            let mut on = cfg.enabled;
+            if widgets::toggle(ui, &mut on, "On").changed() {
+                cfg.enabled = on;
+                sandbox_cfg = Some(cfg.clone());
+            }
+        });
+        row(ui, "E2B API key", if has_key { "Saved in your system keychain." } else { "Your own key from e2b.dev (or E2B_API_KEY in the environment)." }, |ui| {
+            ui.add_enabled_ui(!app.backend_key_pending.contains(craft_anything_ai::keys::SANDBOX_KEY), |ui| {
+                if has_key {
+                    ui.horizontal_wrapped(|ui| {
+                        widgets::pill(ui, "Key saved", t.success, t.raised);
+                        if widgets::secondary(ui, None, "Forget the key").clicked() {
+                            forget_key = Some(craft_anything_ai::keys::SANDBOX_KEY.to_string());
+                        }
+                        if widgets::secondary(ui, Some("radar"), "Test").clicked() {
+                            sandbox_test = true;
+                        }
+                    });
+                }
+                let key = key_drafts.entry(craft_anything_ai::keys::SANDBOX_KEY.to_string()).or_default();
+                ui.horizontal_wrapped(|ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(key)
+                            .password(true)
+                            .hint_text(tr("E2B API key (stored in your system keychain)"))
+                            .desired_width(260.0)
+                            .frame(widgets::text_field_frame_compact(&t)),
+                    );
+                    widgets::named(r, "E2B API key");
+                    let k = key.trim().to_string();
+                    if widgets::primary_icon(ui, None, "Save", !k.is_empty()).clicked() && !k.is_empty() {
+                        save_key = Some((craft_anything_ai::keys::SANDBOX_KEY.to_string(), k));
+                    }
+                });
+            });
+        });
+        row(ui, "Template", "What a new sandbox starts from (a Debian image with Node, Python and git).", |ui| {
+            let id = egui::Id::new("sandbox-template");
+            let saved = cfg.template.clone();
+            let mut text = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(|| saved.clone());
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .id(id)
+                    .desired_width(160.0)
+                    .frame(widgets::text_field_frame_compact(&t)),
+            );
+            if r.changed() {
+                ui.data_mut(|d| d.insert_temp(id, text.clone()));
+            }
+            if r.lost_focus() && text.trim() != saved && !text.trim().is_empty() {
+                cfg.template = text.trim().to_string();
+                sandbox_cfg = Some(cfg.clone());
+            }
+        });
+        row(ui, "Put away after", "How long an unused sandbox stays up before it's paused (and brought back by itself when needed).", |ui| {
+            let id = egui::Id::new("sandbox-timeout");
+            let saved = cfg.timeout_secs.to_string();
+            let mut text = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(|| saved.clone());
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .id(id)
+                    .desired_width(90.0)
+                    .frame(widgets::text_field_frame_compact(&t)),
+            );
+            if r.changed() {
+                ui.data_mut(|d| d.insert_temp(id, text.clone()));
+            }
+            if r.lost_focus()
+                && let Ok(secs) = text.trim().parse::<u64>()
+                && secs >= 60
+                && secs.to_string() != saved
+            {
+                cfg.timeout_secs = secs;
+                sandbox_cfg = Some(cfg.clone());
+            }
+            ui.label(RichText::new(tr("seconds")).color(t.text_faint).size(theme::CAPTION));
+        });
+        row(ui, "Between turns", "Pause the sandbox as soon as a turn is done (it costs nothing while paused).", |ui| {
+            let mut on = cfg.pause_after_turn;
+            if widgets::toggle(ui, &mut on, "Pause").changed() {
+                cfg.pause_after_turn = on;
+                sandbox_cfg = Some(cfg.clone());
+            }
+        });
+        row(ui, "Z.ai credentials in the sandbox", "Let the bundled ZCode agent use this machine's Z.ai credentials there (copied into the sandbox's /etc at setup, and nowhere else).", |ui| {
+            let mut on = cfg.provide_zai_credentials;
+            if widgets::toggle(ui, &mut on, "Copy").changed() {
+                cfg.provide_zai_credentials = on;
+                sandbox_cfg = Some(cfg.clone());
+            }
+        });
+    });
+
+    // Drafts the rows typed into go back to the app; the sandbox key's keeps its own name.
+    key_drafts.retain(|name, _| app.backends.iter().any(|backend| &backend.name == name) || name == craft_anything_ai::keys::SANDBOX_KEY);
     app.backend_key_inputs = key_drafts;
     app.folder_inputs = folder_drafts;
     if let Some((name, key)) = save_key {
@@ -748,6 +894,15 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
     }
     if let Some(e) = extracts {
         app.set_role(craft_anything_ai::Role::Extractor, e);
+    }
+    if let Some(cfg) = sandbox_cfg {
+        app.set_sandbox(cfg);
+    }
+    if let Some((name, mode)) = sandbox_mode {
+        app.set_backend_sandbox(&name, mode);
+    }
+    if sandbox_test {
+        app.test_sandbox();
     }
     ui.add_space(8.0);
     let detected = app.detected.clone().unwrap_or_default();

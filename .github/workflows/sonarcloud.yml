@@ -1,10 +1,9 @@
 name: SonarCloud
 
+# NOTE (fork): this workflow calls a reusable workflow in storytold/craft-common-actions,
+# which this fork cannot invoke. It stays here for future merges and runs only by hand.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    types: [opened, synchronize, reopened]
+  workflow_dispatch:
 
 permissions:
   contents: read

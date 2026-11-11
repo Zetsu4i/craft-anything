@@ -14,6 +14,7 @@ pub mod claude_cost;
 pub mod models;
 mod shared;
 pub mod unfinished;
+pub mod zcode;
 
 pub(crate) use shared::SharedConversation;
 
@@ -55,6 +56,7 @@ pub const KNOWN: &[(&str, &str, &str)] = &[
     ("aider", "aider", "Aider"),
     ("dsh", "dsh", "DeepSeek Harness"),
     ("devin", "devin", "Devin"),
+    ("zcode", "zcode", "ZCode (GLM built-in)"),
 ];
 
 pub fn program_for(agent: &str) -> String {
@@ -599,6 +601,8 @@ pub struct CliSpec {
     /// anywhere. In Clean room a builder sees only Clean room's tools, and every file it reads
     /// goes through the approval policy.
     pub deep: bool,
+    /// The project's cloud sandbox, when this run builds in one instead of on this computer.
+    pub sandbox: Option<std::sync::Arc<crate::sandbox::Sandbox>>,
     /// Replaces the default analysis preamble.
     pub preamble: Option<String>,
     /// How each agent CLI is driven.
@@ -627,12 +631,31 @@ pub struct Builder {
 }
 
 /// Our MCP server for `spec`, in the run's mode whatever the saved settings say; a builder's lists
-/// every tool in Deep mode.
+/// every tool in Deep mode. In a sandbox run the server runs in the sandbox, next to the
+/// project's copy there, so its paths are the sandbox's.
 fn mcp_for(spec: &CliSpec, remote: bool) -> McpCommand {
     let mut mcp = match &spec.builder {
         Some(b) => McpCommand::local_or_remote(remote, b.investigation.clone(), Some(b.inbox.clone())),
         None => McpCommand::local_or_remote(remote, spec.project.clone(), None),
     };
+    if let Some(sb) = &spec.sandbox {
+        mcp.command = crate::sandbox::REMOTE_CLI.to_string();
+        let project = spec.project.as_deref();
+        let remap = |p: &Path| -> String {
+            project
+                .and_then(|base| p.strip_prefix(base).ok())
+                .map(|rel| format!("{}/{}", sb.remote_root, rel.display()))
+                .unwrap_or_else(|| sb.remote_root.clone())
+        };
+        if let Some(b) = &spec.builder {
+            if let Some(inv) = &b.investigation {
+                mcp.args.extend(["--project".into(), remap(inv)]);
+            }
+            mcp.args.extend(["--inbox".into(), remap(&b.inbox)]);
+        } else if project.is_some() {
+            mcp.args.extend(["--project".into(), sb.remote_root.clone()]);
+        }
+    }
     mcp.args.push(if spec.deep { "--deep" } else { "--clean-room" }.into());
     if spec.deep && spec.builder.is_some() {
         mcp.args.push("--all-tools".into());
@@ -658,6 +681,7 @@ impl CliSpec {
             builder: None,
             resume: None,
             deep: false,
+            sandbox: None,
             preamble: None,
             logs: None,
             cost_totals: None,
@@ -669,8 +693,13 @@ impl CliSpec {
 }
 
 /// The conversation for a chat with an agent CLI: over ACP when the backend enables or requires
-/// it and the agent speaks it (a local, non-building run), else one CLI run per message.
+/// it and the agent speaks it (a local, non-building run), else one CLI run per message. The
+/// ZCode agent always gets its own conversation: one background app-server spoken to over its
+/// protocol.
 pub fn conversation(spec: CliSpec) -> Box<dyn Conversation> {
+    if spec.config.model == zcode::AGENT_ID {
+        return Box::new(zcode::ZcodeConversation::new(&spec, None));
+    }
     match acp_for(&spec).filter(|_| spec.builder.is_none()) {
         // In Clean room the agent's own file, shell and web requests are refused, not put to the
         // person as a card they could allow with one click (#564).
@@ -682,8 +711,12 @@ pub fn conversation(spec: CliSpec) -> Box<dyn Conversation> {
 
 /// The conversation for a builder run: over ACP (permission requests decided by `approver`, the
 /// approval policy) when the backend enables or requires it and the agent speaks it, else one
-/// CLI run per message (approvals through our approval tool).
+/// CLI run per message (approvals through our approval tool). The ZCode agent's permission
+/// requests are decided by the same `approver`, over its own protocol.
 pub fn builder_conversation(spec: CliSpec, approver: acp::Approver) -> Box<dyn Conversation> {
+    if spec.config.model == zcode::AGENT_ID {
+        return Box::new(zcode::ZcodeConversation::new(&spec, Some(approver)));
+    }
     match acp_for(&spec) {
         Some(c) => Box::new(c.with_approver(approver)),
         None => Box::new(CliConversation::new(spec)),
@@ -956,12 +989,11 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     }
     let (help, needed) = adapter.required_flags();
     if !needed.is_empty() {
-        let ok = match remote {
-            Some(_) => true, // can't cheaply check a remote CLI; its errors are streamed back
-            None => {
-                let mut v = verified.lock().unwrap_or_else(PoisonError::into_inner);
-                *v.get_or_insert_with(|| verify_flags(&program, help, needed))
-            }
+        let ok = if remote.is_some() || spec.sandbox.is_some() {
+            true // can't cheaply check a CLI that runs elsewhere; its errors are streamed back
+        } else {
+            let mut v = verified.lock().unwrap_or_else(PoisonError::into_inner);
+            *v.get_or_insert_with(|| verify_flags(&program, help, needed))
         };
         if !ok && adapter.plain_fallback() {
             let _ = tx.send(AgentEvent::Status {
@@ -1040,74 +1072,171 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     let records = records.filter(|_| adapter.discards_sessions());
     // Some once tried, recorded or not.
     let held: Arc<Mutex<Option<Option<unfinished::Held>>>> = Arc::new(Mutex::new(None));
-    let (held2, agent2, program2, host2) = (held.clone(), agent.clone(), program.clone(), remote.clone());
     let parser = Arc::new(Mutex::new(StreamParser::new(adapter.clone())));
-    let (p2, tx2, tx_err, lost2, failure2) = (parser.clone(), tx.clone(), tx.clone(), lost.clone(), failure.clone());
     let failed_tools = Arc::new(AtomicBool::new(false));
-    let (failed_tools2, failed_tools3) = (failed_tools.clone(), failed_tools.clone());
-    let stop2 = stop.clone();
     // Set once the stream's own terminal event is parsed, so the process is stopped `RESULT_GRACE`
     // after rather than whenever it happens to exit (its own shutdown hooks aren't ours to wait on).
     let result_seen: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
-    let (result_seen2, result_seen3) = (result_seen.clone(), result_seen.clone());
-    let mut proc = (if remote.is_none() { adapter.process(&prog) } else { Process::new(&prog) })
-        .args(&argv)
-        .timeout(Duration::from_secs(spec.options.timeout_secs.unwrap_or(turn)))
-        .idle_timeout(Duration::from_secs(quiet));
-    for (k, v) in &env {
-        proc = proc.env(k, v.as_str());
+    /// What a stream's lines become: events for the app, a session record, a failure to keep.
+    /// Shared by the local runner and the sandbox runner, whose callbacks are the same.
+    struct RunHooks {
+        parser: Arc<Mutex<StreamParser>>,
+        tx: Sender<AgentEvent>,
+        records: Option<PathBuf>,
+        held: Arc<Mutex<Option<Option<unfinished::Held>>>>,
+        agent: String,
+        program: String,
+        host: Option<String>,
+        lost: Arc<AtomicBool>,
+        failure: Arc<Mutex<Option<TurnFailure>>>,
+        failed_tools: Arc<AtomicBool>,
+        result_seen: Arc<Mutex<Option<std::time::Instant>>>,
     }
-    let mut proc = proc
-        .stdout_cap(4 * 1024 * 1024)
-        .cancel_when(move || {
-            let seen: Option<std::time::Instant> = *result_seen3.lock().unwrap_or_else(PoisonError::into_inner);
-            stop2.is_stopped() || failed_tools2.load(Ordering::SeqCst) || seen.is_some_and(|at| at.elapsed() >= RESULT_GRACE)
-        })
-        .on_stdout_line(move |l| {
-            if failed_tools3.load(Ordering::SeqCst) {
+    impl RunHooks {
+        fn on_line(&self, l: &str) {
+            if self.failed_tools.load(Ordering::SeqCst) {
                 return;
             }
-            let mut p = p2.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut p = self.parser.lock().unwrap_or_else(PoisonError::into_inner);
             let events = p.line(l);
-            if let (Some(dir), Some(id)) = (&records, &p.run_session) {
-                let mut h = held2.lock().unwrap_or_else(PoisonError::into_inner);
+            if let (Some(dir), Some(id)) = (&self.records, &p.run_session) {
+                let mut h = self.held.lock().unwrap_or_else(PoisonError::into_inner);
                 if h.is_none() {
-                    *h = Some(unfinished::Held::record(dir, &unfinished::Entry::new(&agent2, &program2, host2.as_deref(), id)).ok());
+                    *h = Some(unfinished::Held::record(dir, &unfinished::Entry::new(&self.agent, &self.program, self.host.as_deref(), id)).ok());
                 }
             }
             // Said before the error that follows it, so whoever reads the error can tell.
             if p.session_missing {
-                lost2.store(true, Ordering::SeqCst);
+                self.lost.store(true, Ordering::SeqCst);
             }
             if let Some(failed) = p.failure {
-                *failure2.lock().unwrap_or_else(PoisonError::into_inner) = Some(failed);
+                *self.failure.lock().unwrap_or_else(PoisonError::into_inner) = Some(failed);
                 if failed.kind == FailureKind::ToolsUnavailable {
-                    failed_tools3.store(true, Ordering::SeqCst);
+                    self.failed_tools.store(true, Ordering::SeqCst);
                 }
             }
             if p.saw_result {
-                let mut seen = result_seen2.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut seen = self.result_seen.lock().unwrap_or_else(PoisonError::into_inner);
                 if seen.is_none() {
                     *seen = Some(std::time::Instant::now());
                 }
             }
             for e in events {
-                let _ = tx2.send(e);
+                let _ = self.tx.send(e);
             }
-        })
-        .on_stderr_line(move |l| {
+        }
+
+        fn on_err(&self, l: &str) {
             if !l.trim().is_empty() {
-                let _ = tx_err.send(AgentEvent::Output { text: l.to_string() });
+                let _ = self.tx.send(AgentEvent::Output { text: l.to_string() });
             }
+        }
+
+        fn cancelled(&self, stop: &Stop) -> bool {
+            let seen: Option<std::time::Instant> = *self.result_seen.lock().unwrap_or_else(PoisonError::into_inner);
+            stop.is_stopped() || self.failed_tools.load(Ordering::SeqCst) || seen.is_some_and(|at| at.elapsed() >= RESULT_GRACE)
+        }
+    }
+    let hooks = Arc::new(RunHooks {
+        parser: parser.clone(),
+        tx: tx.clone(),
+        records: records.clone(),
+        held: held.clone(),
+        agent: agent.clone(),
+        program: program.clone(),
+        host: remote.clone(),
+        lost: lost.clone(),
+        failure: failure.clone(),
+        failed_tools: failed_tools.clone(),
+        result_seen: result_seen.clone(),
+    });
+    let started_at = std::time::Instant::now();
+    let result = if let Some(sb) = &spec.sandbox {
+        // The project's sandbox: everything the project has travels up, the agent works on the
+        // copy there, and what it builds travels back after the turn.
+        let project_root = spec.project.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
+        let mut status = |line: String| {
+            let _ = tx.send(AgentEvent::Status { text: line });
+        };
+        if let Err(e) = sb.sync_up(&project_root, &mut status) {
+            let _ = tx.send(AgentEvent::Error { message: e.message, remediation: e.remediation, log: None });
+            return nothing_done(&name);
+        }
+        let _ = tx.send(AgentEvent::Status { text: format!("Building in the sandbox ({}).", sb.id()) });
+        let Ok(envd) = sb.envd() else {
+            let _ = tx.send(AgentEvent::Error {
+                message: "The sandbox is no longer connected.".into(),
+                remediation: Some("Start the build again: the sandbox is brought back on its own.".into()),
+                log: None,
+            });
+            return nothing_done(&name);
+        };
+        let mut proc = craft_anything_engines::e2b::SandboxProcess::new(envd, &prog)
+            .args(&argv)
+            .cwd(&sb.remote_root)
+            .timeout(Duration::from_secs(spec.options.timeout_secs.unwrap_or(turn)))
+            .idle_timeout(Duration::from_secs(quiet));
+        for (k, v) in &env {
+            proc = proc.env(k, v.as_str());
+        }
+        let mut proc = proc
+            .cancel_when({
+                let hooks = hooks.clone();
+                let stop2 = stop.clone();
+                move || hooks.cancelled(&stop2)
+            })
+            .on_stdout_line({
+                let hooks = hooks.clone();
+                move |l: &str| hooks.on_line(l)
+            })
+            .on_stderr_line({
+                let hooks = hooks.clone();
+                move |l: &str| hooks.on_err(l)
+            });
+        if adapter.prompt_on_stdin() {
+            proc = proc.stdin_bytes(adapter.stdin_text(&preamble, text).into_bytes());
+        }
+        proc.run().map(|out| craft_anything_platform::process::Output {
+            code: out.code,
+            success: out.success,
+            stdout: out.stdout,
+            stderr: out.stderr,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration: started_at.elapsed(),
         })
-        .remediation(format!("Install {}, or choose its program in Settings → AI.", display_for(&agent)));
-    if let Some(p) = spec.project.as_ref().filter(|_| remote.is_none()) {
-        proc = proc.cwd(p);
-    }
-    if adapter.prompt_on_stdin() {
-        proc = proc.stdin_bytes(adapter.stdin_text(&preamble, text));
-    }
-    let result = proc.run();
+    } else {
+        let mut proc = (if remote.is_none() { adapter.process(&prog) } else { Process::new(&prog) })
+            .args(&argv)
+            .timeout(Duration::from_secs(spec.options.timeout_secs.unwrap_or(turn)))
+            .idle_timeout(Duration::from_secs(quiet));
+        for (k, v) in &env {
+            proc = proc.env(k, v.as_str());
+        }
+        let mut proc = proc
+            .stdout_cap(4 * 1024 * 1024)
+            .cancel_when({
+                let hooks = hooks.clone();
+                let stop2 = stop.clone();
+                move || hooks.cancelled(&stop2)
+            })
+            .on_stdout_line({
+                let hooks = hooks.clone();
+                move |l: &str| hooks.on_line(l)
+            })
+            .on_stderr_line({
+                let hooks = hooks.clone();
+                move |l: &str| hooks.on_err(l)
+            })
+            .remediation(format!("Install {}, or choose its program in Settings → AI.", display_for(&agent)));
+        if let Some(p) = spec.project.as_ref().filter(|_| remote.is_none()) {
+            proc = proc.cwd(p);
+        }
+        if adapter.prompt_on_stdin() {
+            proc = proc.stdin_bytes(adapter.stdin_text(&preamble, text));
+        }
+        proc.run()
+    };
     let p = parser.lock().unwrap_or_else(PoisonError::into_inner);
     if p.session_missing {
         // The id it reported is the one it couldn't find: the next message starts a new session.
@@ -1169,10 +1298,11 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         }
     }
     // #1115: a turn that didn't finish leaves its session marked as running, and the agent's
-    // background service may pick it up later and carry on with nobody watching.
+    // background service may pick it up later and carry on with nobody watching. In the sandbox
+    // the agent's sessions live there and nothing of ours sweeps them.
     let held = held.lock().unwrap_or_else(PoisonError::into_inner).take().flatten();
     let gone = match &p.run_session {
-        Some(id) if unfinished => match adapter.discard_unfinished(&program, id, remote.as_deref()) {
+        Some(id) if unfinished && spec.sandbox.is_none() => match adapter.discard_unfinished(&program, id, remote.as_deref()) {
             Ok(()) => true,
             Err(e) => {
                 let fix = e.remediation.map(|r| format!(" {r}")).unwrap_or_default();
@@ -1185,6 +1315,27 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     // Kept (unlocked) when the delete failed, so a later sweep tries again.
     if gone && let Some(h) = held {
         h.done();
+    }
+    // What the agent built in the sandbox comes back to the project here, and the sandbox pauses
+    // until the next turn (E2B brings it back on its own; nothing is lost in between).
+    if let Some(sb) = &spec.sandbox
+        && let Some(project_root) = spec.project.as_deref()
+    {
+        let mut status = |line: String| {
+            let _ = tx.send(AgentEvent::Status { text: line });
+        };
+        match sb.sync_down(project_root, &mut status) {
+            Ok(summary) => {
+                let _ = tx.send(AgentEvent::Status { text: format!("The sandbox's work is copied back ({}).", summary.describe(false)) });
+            }
+            Err(e) => {
+                let _ = tx.send(AgentEvent::Status { text: format!("Couldn't copy the sandbox's work back: {}", e.message) });
+            }
+        }
+        if sb.config.pause_after_turn {
+            sb.pause();
+            let _ = tx.send(AgentEvent::Status { text: "The sandbox is paused until the next turn.".into() });
+        }
     }
     // Claude Code's total is the session's running total (#1187); a question's copy is answered by
     // question.rs, which keeps no cost for it.
@@ -3008,7 +3159,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
         reg.register(Arc::new(EchoAgent));
         assert_eq!(
             format!("{reg:?}"),
-            r#"["claude-code", "codex", "gemini-cli", "opencode", "antigravity", "hermes", "maki", "aider", "copilot", "grok", "dsh", "devin", "echo-agent"]"#
+            r#"["claude-code", "codex", "gemini-cli", "opencode", "antigravity", "hermes", "maki", "aider", "copilot", "grok", "dsh", "devin", "zcode", "echo-agent"]"#
         );
     }
 

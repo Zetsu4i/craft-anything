@@ -9,6 +9,7 @@ pub mod adb;
 pub mod assets;
 pub mod cdp;
 pub mod cutter;
+pub mod e2b;
 pub mod frida;
 pub mod game;
 pub mod gdb;
