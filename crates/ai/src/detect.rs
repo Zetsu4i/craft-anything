@@ -146,11 +146,21 @@ pub fn probe_local(label: &str, base: &str) -> Option<Detected> {
     Some(Detected { suggestion: c, reason, needs_key: false })
 }
 
-/// Agent CLIs on PATH.
+/// Agent CLIs on PATH. The ZCode agent is offered whether or not a copy is on this computer: the
+/// app doesn't carry it — it runs in the project's cloud sandbox, or from a folder the person
+/// points Settings → AI at — so it goes first, with the reason saying what was found.
 pub fn agent_clis() -> Vec<Detected> {
     crate::cli_agents::KNOWN
         .iter()
         .filter_map(|(id, prog, display)| {
+            if *id == crate::cli_agents::zcode::AGENT_ID {
+                let found = crate::cli_agents::zcode::local_agent_dir(crate::cli_agents::zcode::settings_zcode_dir().as_deref());
+                let reason = match found {
+                    Some(p) => format!("Found {display} at {} (it also runs in the project's cloud sandbox)", p.display()),
+                    None => format!("{display} runs in the project's cloud sandbox (Settings → AI → Sandbox); a local copy can be named in Settings → AI"),
+                };
+                return Some(Detected { suggestion: cfg(display, BackendKind::AgentCli, id), reason, needs_key: false });
+            }
             crate::cli_agents::find_program(prog).map(|p| Detected {
                 suggestion: cfg(display, BackendKind::AgentCli, id),
                 reason: format!("Found {display} at {}", p.display()),

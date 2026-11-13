@@ -350,6 +350,16 @@ impl CraftApp {
         });
     }
 
+    /// Name (or clear) the folder holding a local copy of the ZCode agent.
+    pub fn set_zcode_agent_dir(&mut self, dir: &str) {
+        let hub = self.hub.clone();
+        let dir = dir.to_string();
+        self.jobs.spawn(tr("Set the ZCode agent folder"), false, move |_| {
+            hub.set_zcode_agent_dir(&dir).map_err(|e| e.message)?;
+            Ok(crate::backends(&hub))
+        });
+    }
+
     /// Try the sandbox provider with the key that's saved, without starting anything.
     pub fn test_sandbox(&mut self) {
         let hub = self.hub.clone();

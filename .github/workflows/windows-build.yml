@@ -1,7 +1,13 @@
-# The Windows build: one portable package with the app, the CLI helper next to it, and the
-# bundled ZCode agent (its runtime and search tools are fetched at build time, so this
-# repository stays light — see resources/zcode/README.md). A Linux build of the CLI helper
-# comes along too, for the sandbox's tool server.
+# The Windows build: one portable package with the app and its CLI helper, and nothing else
+# heavy. The ZCode agent is deliberately NOT in the package — it is not ours to ship — and the
+# sandbox fetches what it needs itself:
+#   • a sandbox from the ZCode template (e2b-template/ in this repository) already carries the
+#     agent, Node 22 and every tool;
+#   • any other sandbox downloads the agent bundle and the Linux CLI helper at setup, straight
+#     into the box, from the releases that point at them (see crates/ai/src/sandbox.rs).
+# That keeps the download small (no Node runtime, no agent bundle inside) and the agent off
+# people's disks: it only ever runs inside the sandbox, or from a folder its owner points
+# Settings → AI at.
 #
 # The upstream release pipeline (WiX MSI, signing, every platform) lives in a private reusable
 # workflow this fork can't call; this one is self-contained and produces the Windows exe.
@@ -18,10 +24,6 @@ permissions:
 
 env:
   CARGO_INCREMENTAL: 0
-  NODE_VERSION: 22.20.0
-  RG_VERSION: 14.1.1
-  UGREP_VERSION: v7.8.5
-  ZCODE_APP_CLI_VERSION: 3.17.2-45
 
 jobs:
   linux-cli:
@@ -99,79 +101,9 @@ jobs:
         with:
           key: windows-exe
           cache-on-failure: true
-      - name: Cache Windows packaging downloads
-        uses: actions/cache@v4
-        with:
-          key: windows-packaging-${{ env.NODE_VERSION }}-${{ env.RG_VERSION }}-${{ env.UGREP_VERSION }}-${{ env.ZCODE_APP_CLI_VERSION }}
-          path: .cache/windows-build
 
       - name: Build the app and its CLI helper
         run: cargo build --release -p craft-anything -p craft-anything-cli
-
-      - name: Fetch the ZCode agent
-        shell: pwsh
-        run: |
-          $cache = ".cache/windows-build"
-          New-Item -ItemType Directory -Force -Path $cache | Out-Null
-          New-Item -ItemType Directory -Force -Path resources/zcode/node, resources/zcode/resources | Out-Null
-          $cachedZcode = "$cache/zcode-$env:ZCODE_APP_CLI_VERSION.cjs"
-          if (-not (Test-Path $cachedZcode)) {
-            $meta = Invoke-RestMethod -Uri "https://registry.npmjs.org/zcode-app-cli/$env:ZCODE_APP_CLI_VERSION"
-            $tgz = "$env:RUNNER_TEMP/zcode-app-cli.tgz"
-            $extract = "$env:RUNNER_TEMP/zcode-app-cli"
-            if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
-            New-Item -ItemType Directory -Force -Path $extract | Out-Null
-            Invoke-WebRequest -Uri $meta.dist.tarball -OutFile $tgz
-            tar -xzf $tgz -C $extract
-            Copy-Item "$extract/package/vendor/zcode.cjs" $cachedZcode -Force
-          }
-          Copy-Item $cachedZcode resources/zcode/zcode.cjs -Force
-          $zcode = (Get-Item resources/zcode/zcode.cjs).Length
-          if ($zcode -lt 1000000) { throw "zcode.cjs looks wrong ($zcode bytes)" }
-          Write-Host "zcode.cjs: $zcode bytes"
-
-      - name: Fetch the Node 22 runtime
-        shell: pwsh
-        run: |
-          $cache = ".cache/windows-build"
-          $zip = "$cache/node-v${env:NODE_VERSION}-win-x64.zip"
-          $extract = "$cache/node-v${env:NODE_VERSION}-win-x64"
-          if (-not (Test-Path "$extract/node.exe")) {
-            Invoke-WebRequest -Uri "https://nodejs.org/dist/v${env:NODE_VERSION}/node-v${env:NODE_VERSION}-win-x64.zip" -OutFile $zip
-            Expand-Archive -Path $zip -DestinationPath $cache -Force
-          }
-          Copy-Item "$extract/node.exe" resources/zcode/node/node.exe -Force
-          & resources/zcode/node/node.exe --version
-
-      - name: Fetch the agent's search tools
-        shell: pwsh
-        run: |
-          $cache = ".cache/windows-build"
-          $rgZip = "$cache/ripgrep-${env:RG_VERSION}.zip"
-          $rgExtract = "$cache/ripgrep-${env:RG_VERSION}"
-          if (-not (Test-Path "$rgExtract/ripgrep-${env:RG_VERSION}-x86_64-pc-windows-msvc/rg.exe")) {
-            Invoke-WebRequest -Uri "https://github.com/BurntSushi/ripgrep/releases/download/${env:RG_VERSION}/ripgrep-${env:RG_VERSION}-x86_64-pc-windows-msvc.zip" -OutFile $rgZip
-            Expand-Archive -Path $rgZip -DestinationPath $rgExtract -Force
-          }
-          Copy-Item "$rgExtract/ripgrep-${env:RG_VERSION}-x86_64-pc-windows-msvc/rg.exe" resources/zcode/resources/rg.exe -Force
-
-          # The agent looks these up by name (rg.exe, ugrep.exe) in its resources folder, so a
-          # bundle missing one is a broken builder. ugrep's release zip also nests its exe in a
-          # folder whose name has changed between versions: find it rather than hard-coding it.
-          $ugZip = "$cache/ugrep-${env:UGREP_VERSION}.zip"
-          $ugExtract = "$cache/ugrep-${env:UGREP_VERSION}"
-          if (-not (Get-ChildItem $ugExtract -Recurse -Filter 'ugrep.exe' -ErrorAction SilentlyContinue)) {
-            Invoke-WebRequest -Uri "https://github.com/Genivia/ugrep/releases/download/${env:UGREP_VERSION}/ugrep-windows-x64.zip" -OutFile $ugZip
-            Expand-Archive -Path $ugZip -DestinationPath $ugExtract -Force
-          }
-          $ugrep = Get-ChildItem $ugExtract -Recurse -Filter 'ugrep.exe' | Select-Object -First 1
-          if (-not $ugrep) { throw "ugrep-windows-x64.zip (${env:UGREP_VERSION}) holds no ugrep.exe" }
-          Copy-Item $ugrep.FullName resources/zcode/resources/ugrep.exe -Force
-          foreach ($tool in 'rg.exe', 'ugrep.exe') {
-            $path = "resources/zcode/resources/$tool"
-            if (-not (Test-Path $path)) { throw "$path is missing after fetching the search tools" }
-          }
-          Get-ChildItem resources/zcode -Recurse -File | ForEach-Object { Write-Host "$($_.Length)`t$($_.FullName)" }
 
       # The artifact's name is not the file's name: upload-artifact zips the file under the path
       # inside the uploaded folder, so this downloads back as `craft-anything-cli-linux` only
@@ -205,28 +137,24 @@ jobs:
           Copy-Item $cli.FullName resources/sandbox/craft-anything-cli-linux -Force
           Write-Host "sandbox CLI: $($cli.Length) bytes"
 
+      # The package: the app and its CLI helper for this computer. The Linux helper travels to the
+      # sandbox at setup (a template carries it, or the sandbox fetches it from this repository's
+      # release), so it is not in the zip: one CLI per computer, no duplicate inside the package.
       - name: Package the portable app
         shell: pwsh
         run: |
           $stage = "$env:RUNNER_TEMP/craft-anything"
           if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path "$stage/resources", "$stage/resources/sandbox" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage/resources" | Out-Null
           foreach ($exe in 'craft-anything.exe', 'craft-anything-cli.exe') {
             if (-not (Test-Path "target/release/$exe")) { throw "target/release/$exe is missing: the build above didn't produce it" }
             Copy-Item "target/release/$exe" $stage/
           }
-          # The whole folder (dotfiles included), so nothing the agent needs is left behind.
-          Copy-Item resources/zcode $stage/resources -Recurse
-          Copy-Item resources/sandbox/craft-anything-cli-linux $stage/resources/sandbox/craft-anything-cli-linux -Force
-          # The app finds the CLI beside itself (resources/sandbox/), and the agent finds zcode.cjs,
-          # its node.exe and its search tools inside resources/zcode/ — check the package, not the
-          # checkout, so a layout mistake fails here rather than on someone's desktop.
+          # The app finds the CLI beside itself; check the package, not the checkout, so a layout
+          # mistake fails here rather than on someone's desktop.
           $expected = @(
-            'resources/sandbox/craft-anything-cli-linux',
-            'resources/zcode/zcode.cjs',
-            'resources/zcode/node/node.exe',
-            'resources/zcode/resources/rg.exe',
-            'resources/zcode/resources/ugrep.exe'
+            'craft-anything.exe',
+            'craft-anything-cli.exe'
           )
           foreach ($rel in $expected) {
             if (-not (Test-Path (Join-Path $stage $rel))) { throw "the package is missing $rel" }
@@ -235,7 +163,8 @@ jobs:
           if (Test-Path $zip) { Remove-Item $zip }
           Compress-Archive -Path "$stage/*" -DestinationPath $zip
           Move-Item $zip craft-anything-windows-x64.zip -Force
-          Get-Item craft-anything-windows-x64.zip | ForEach-Object { Write-Host "package: $($_.Length) bytes" }
+          Move-Item resources/sandbox/craft-anything-cli-linux craft-anything-cli-linux -Force
+          Get-Item craft-anything-windows-x64.zip, craft-anything-cli-linux | ForEach-Object { Write-Host "$($_.Name): $($_.Length) bytes" }
 
       - name: Upload the package
         uses: actions/upload-artifact@v4
@@ -248,4 +177,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: craft-anything-windows-x64.zip
+          files: |
+            craft-anything-windows-x64.zip
+            craft-anything-cli-linux

@@ -1183,7 +1183,12 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         let mut status = |line: String| {
             let _ = tx.send(AgentEvent::Status { text: line });
         };
-        if let Err(e) = sb.sync_up(&project_root, &mut status) {
+        // A ZCode builder's sandbox gets the agent and its provider route at setup; the saved
+        // key (if there is one) travels as the direct route, the credentials as the bridge's.
+        let zcode_setup = (spec.config.model == zcode::AGENT_ID).then(|| crate::sandbox::ZcodeSetup {
+            api_key: crate::keys::KeyStore::system().get(&spec.config.name),
+        });
+        if let Err(e) = sb.sync_up(&project_root, &mut status, zcode_setup.as_ref()) {
             let _ = tx.send(AgentEvent::Error { message: e.message, remediation: e.remediation, log: None });
             return nothing_done(&name);
         }
@@ -1226,6 +1231,10 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
             success: out.success,
             stdout: out.stdout,
             stderr: out.stderr,
+            // The engine's own Output carries no tail: the platform's fallback (the whole
+            // stdout) is what a sandboxed run reports, as it always has.
+            stdout_tail: Vec::new(),
+            stderr_tail: Vec::new(),
             stdout_truncated: false,
             stderr_truncated: false,
             duration: started_at.elapsed(),

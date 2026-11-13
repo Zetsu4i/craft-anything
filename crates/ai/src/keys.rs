@@ -33,6 +33,15 @@ pub fn sandbox_key(store: &KeyStore) -> Option<String> {
     store.get(SANDBOX_KEY).or_else(|| std::env::var("E2B_API_KEY").ok()).map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
 }
 
+/// Where the token that fetches the ZCode agent into a sandbox is stored (Settings → AI →
+/// Sandbox). The agent's repository can be private; the token is used by the sandbox alone.
+pub const AGENT_TOKEN: &str = "sandbox:zcode-token";
+
+/// The agent repository's token: stored, else `ZCODE_AGENT_TOKEN`.
+pub fn agent_token(store: &KeyStore) -> Option<String> {
+    store.get(AGENT_TOKEN).or_else(|| std::env::var("ZCODE_AGENT_TOKEN").ok()).map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+}
+
 /// Where an asset provider's key is stored (`assets:<provider id>`).
 pub fn asset_key_name(provider: &str) -> String {
     format!("assets:{provider}")

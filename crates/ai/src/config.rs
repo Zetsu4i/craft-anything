@@ -281,6 +281,11 @@ pub struct AiConfig {
     /// prompt caching survives restarts (and tests stay inside their own settings file).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_id: Option<String>,
+    /// The folder holding a local copy of the ZCode agent (`[ai] zcode_dir = "…"`), when the
+    /// person keeps one on this computer. The sandbox route doesn't need it: the agent is fetched
+    /// there at setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zcode_dir: Option<String>,
     /// Builds in a cloud sandbox instead of this computer's folders (`[ai.sandbox]`).
     #[serde(default, skip_serializing_if = "crate::sandbox::SandboxConfig::is_default")]
     pub sandbox: crate::sandbox::SandboxConfig,

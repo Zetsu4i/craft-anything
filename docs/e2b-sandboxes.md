@@ -31,8 +31,13 @@ involved in your account beyond the calls it makes with the key you give it.
   A paused sandbox costs nothing; the next turn **brings it back** with its files exactly as
   they were. Turn **Restore off** (`auto_pause = false`) if you'd rather it was killed at the
   timeout and every project started fresh — nothing carries over then.
-- **The app's tool server travels too**: a Linux build of `craft-anything-cli` is uploaded at
-  setup, so the agent's approvals, questions and checklists work in the sandbox as usual.
+- **The app's tool server is there**: a Linux build of `craft-anything-cli` — carried by the
+  template, uploaded from beside the app when the package has one, or fetched by the sandbox
+  from this repository's release at setup — so the agent's approvals, questions and checklists
+  work in the sandbox as usual.
+- **The ZCode agent is set up there too** (when a ZCode builder runs): its bundle is fetched
+  straight into the box, Node 22 is ensured, and the GLM bridge is health-checked — see
+  `docs/zcode-agent.md`. Nothing of the agent lands on this computer.
 
 ## What stays where
 
@@ -49,7 +54,8 @@ involved in your account beyond the calls it makes with the key you give it.
 | --- | --- | --- |
 | `enabled` | `false` | Builders with "as set below" build in the cloud. |
 | `provider` | `"e2b"` | The sandbox service (the one there is today). |
-| `template` | `"base"` | What a new sandbox starts from (Debian + Node + Python + git). |
+| `template` | `"base"` | What a new sandbox starts from. The fork's own template (`craft-zcode`, built from `e2b-template/`) carries the agent, Node 22 and the whole tool workshop; `base` is E2B's plain Debian image and sets itself up at first turn. |
+| `zcode_agent_url` | *(the agent repository's release)* | Where a sandbox fetches the ZCode agent bundle from, when its template doesn't carry it. |
 | `timeout_secs` | `1800` | How long an unused sandbox stays up before E2B pauses it. |
 | `auto_pause` | `true` | Pause (snapshot) at the timeout instead of killing it. |
 | `pause_after_turn` | `true` | Pause right after every builder turn. |
@@ -57,4 +63,14 @@ involved in your account beyond the calls it makes with the key you give it.
 
 The key itself lives in the system keychain (service `ai.storyteller.craft-anything`, entry
 `sandbox:e2b`), with a 0600 fallback file when there is no keychain. It is never logged and
-never written to a project file.
+never written to a project file. The ZCode repo token (entry `sandbox:zcode-token`) is kept the
+same way and is used by the sandbox alone.
+
+## The template with everything inside
+
+`e2b-template/` in this repository builds a sandbox template that boots fully set up: the ZCode
+agent, its Node 22 runtime and bridge SDK, the CLI tool server, and the whole workshop of tools
+(Java, Rust, Godot, adb, JADX, Apktool, Chrome, Frida, GDB, LLDB, mitmproxy, binwalk, unblob,
+ilspycmd, tshark, objdump, Rizin, rtl_433, Vineflower, ripgrep, ugrep). Build it once
+(`bash e2b-template/build.sh` — see its README), then put the template id in Settings → AI →
+Sandbox → **Template**.

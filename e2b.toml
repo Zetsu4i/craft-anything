@@ -1,0 +1,4 @@
+# E2B's template definition. `e2b template build` reads this file from the folder it runs in —
+# build.sh changes into the repository root before calling it.
+template_id = "craft-zcode"
+dockerfile_path = "e2b-template/Dockerfile"

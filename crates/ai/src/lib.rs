@@ -901,6 +901,7 @@ impl AiHub {
             .map(|b| (b.config.name.clone(), self.keys.get(&b.config.name).is_some()))
             .collect();
         keys.insert(keys::SANDBOX_KEY.to_string(), keys::sandbox_key(&self.keys).is_some());
+        keys.insert(keys::AGENT_TOKEN.to_string(), keys::agent_token(&self.keys).is_some());
         keys
     }
 
@@ -908,6 +909,9 @@ impl AiHub {
     pub fn saved_backend_key(&self, name: &str) -> Result<bool, ToolError> {
         if name == keys::SANDBOX_KEY {
             return Ok(keys::sandbox_key(&self.keys).is_some());
+        }
+        if name == keys::AGENT_TOKEN {
+            return Ok(keys::agent_token(&self.keys).is_some());
         }
         if !Self::takes_key(&self.entry(name)?.config) {
             return Err(ToolError::invalid("A coding agent keeps its own sign-in; there is no saved key to report here."));
@@ -920,7 +924,13 @@ impl AiHub {
     pub fn set_backend_key(&self, name: &str, key: &str) -> Result<(), ToolError> {
         let edit = self.backend_edits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         edit.label("Backend key or removal");
-        if name != keys::SANDBOX_KEY && !Self::takes_key(&self.entry(name)?.config) {
+        if name == keys::SANDBOX_KEY {
+            return self.set_sandbox_key(key);
+        }
+        if name == keys::AGENT_TOKEN {
+            return self.set_agent_token(key);
+        }
+        if !Self::takes_key(&self.entry(name)?.config) {
             return Err(ToolError::invalid("A coding agent keeps its own sign-in; there is no key to save for it here."));
         }
         let key = key.trim();
@@ -943,7 +953,13 @@ impl AiHub {
     pub fn remove_backend_key(&self, name: &str) -> Result<(), ToolError> {
         let edit = self.backend_edits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         edit.label("Backend key or removal");
-        if name != keys::SANDBOX_KEY && !Self::takes_key(&self.entry(name)?.config) {
+        if name == keys::SANDBOX_KEY {
+            return self.remove_sandbox_key();
+        }
+        if name == keys::AGENT_TOKEN {
+            return self.remove_agent_token();
+        }
+        if !Self::takes_key(&self.entry(name)?.config) {
             return Err(ToolError::invalid("A coding agent keeps its own sign-in; there is no saved key to forget here."));
         }
         self.keys.delete(name)
@@ -975,6 +991,45 @@ impl AiHub {
         let edit = self.backend_edits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         edit.label("Sandbox key");
         self.keys.delete(keys::SANDBOX_KEY)
+    }
+
+    /// The ZCode agent folder the settings name, when there is one (`[ai] zcode_dir`).
+    pub fn zcode_agent_dir(&self) -> Option<String> {
+        self.config().zcode_dir
+    }
+
+    /// Point Settings → AI → ZCode agent folder at a folder; an empty string clears it.
+    pub fn set_zcode_agent_dir(&self, dir: &str) -> Result<(), ToolError> {
+        let edit = self.backend_edits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        edit.label("ZCode agent folder");
+        let dir = dir.trim();
+        let mut c = self.config_to_change()?;
+        c.zcode_dir = (!dir.is_empty()).then(|| dir.to_string());
+        self.save_config(&c)
+    }
+
+    /// Whether the ZCode agent repository's token is saved (sandboxes use it to fetch the agent).
+    pub fn has_agent_token(&self) -> bool {
+        keys::agent_token(&self.keys).is_some()
+    }
+
+    /// Save the ZCode agent repository's token. Used by the sandbox alone; it never leaves the
+    /// keychain for anything else.
+    pub fn set_agent_token(&self, token: &str) -> Result<(), ToolError> {
+        let edit = self.backend_edits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        edit.label("ZCode agent repository token");
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(ToolError::invalid("The token is empty."));
+        }
+        self.keys.set(keys::AGENT_TOKEN, token).map(|_| ())
+    }
+
+    /// Forget the ZCode agent repository's token.
+    pub fn remove_agent_token(&self) -> Result<(), ToolError> {
+        let edit = self.backend_edits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        edit.label("ZCode agent repository token");
+        self.keys.delete(keys::AGENT_TOKEN)
     }
 
     /// Try the sandbox provider with the key that's set, without starting anything: the settings

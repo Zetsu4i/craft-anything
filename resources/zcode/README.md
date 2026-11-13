@@ -1,52 +1,29 @@
-# resources/zcode — the ZCode agent, as Craft Anything ships it
+# resources/zcode — a local copy of the ZCode agent, when you keep one here
 
-This folder is what the desktop app carries for the **ZCode (GLM built-in)** builder: the
-person's own coding agent (`zcode.cjs`), run in the background and spoken to over its NDJSON
-app-server protocol instead of a per-message CLI run.
+The app does **not** ship the ZCode agent: it lives in its own repository
+([`Zetsu4i/zcode-agent-core`](https://github.com/Zetsu4i/zcode-agent-core)), which publishes
+`zcode-agent-bundle.tar.gz` (the agent `zcode.cjs`, the provider catalogue
+`config/zcode-builtin.json`, and the bridge `zai-bridge.cjs`). Sandboxes fetch that bundle
+straight into the box at setup — nothing of it lands on this computer or inside the exe.
 
-| File | What it is | Committed? |
-| --- | --- | --- |
-| `zai-bridge.cjs` | The local bridge behind "GLM (built-in)": serves `POST /llm/v1/chat/completions` from the machine's `.z-ai-config` (working folder → home → `/etc`). No dependencies. | yes |
-| `config/zcode-builtin.json` | The agent's provider catalogue; the app points `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` at it. | yes |
-| `zcode.cjs` | The agent itself (Node ≥ 22.5). ~15 MB, fetched at build time so this repository stays light. | no — see below |
-| `node/node.exe` | A Node 22 runtime for Windows, fetched at build time. | no — see below |
-| `resources/rg.exe`, `resources/ugrep.exe` | The agent's search binaries for Windows, fetched at build time. | no — see below |
-
-## Where the fetched pieces come from
-
-The build workflow (`.github/workflows/windows-build.yml`) fetches, in order:
-
-1. `zcode.cjs` from the `zcode-app-cli` npm package (`vendor/zcode.cjs` in its tarball; the
-   version is the workflow's `ZCODE_APP_CLI_VERSION`). Bump that variable to move to a newer agent.
-2. `node-v22*-win-x64` from nodejs.org, extracted into `node/`.
-3. `rg.exe` (ripgrep) and `ugrep.exe` (ugrep) from their GitHub releases, into `resources/`.
-
-The agent finds each piece beside itself: the app starts `node/node.exe` with `zcode.cjs`, and the
-agent looks for `rg.exe` and `ugrep.exe` in `resources/`. A package missing any of them builds fine
-and then fails on someone's desktop, so the workflow checks the staged package before zipping it.
-
-`bfs` is not fetched: the agent does not use it on Windows, and the sandbox's Linux copies of these
-tools come from the agent's own downloads there.
-
-For a **local** development run, either build the workflow once and copy its artifact, or drop
-the files in by hand:
-
-```sh
-# any folder works; point CRAFT_ANYTHING_ZCODE_DIR at it if it isn't <exe>/resources/zcode
-curl -o resources/zcode/zcode.cjs https://raw.githubusercontent.com/Zetsu4i/zcode-agent-core/main/extracted/zcode.cjs
-```
+This folder is only a **convenience for local runs**: when Settings → AI → ZCode agent folder
+(or `CRAFT_ANYTHING_ZCODE_DIR`) names a folder holding `zcode.cjs`, that copy runs on this
+computer. Dropping the bundle's files here (`zcode.cjs`, `config/zcode-builtin.json`,
+`zai-bridge.cjs`, and optionally `node/node.exe` and `resources/rg.exe`/`ugrep.exe`) makes this
+folder work as that local copy for a build of the app beside it.
 
 ## How the app runs it
 
 - Local: `node zcode.cjs app-server --stdio`, with `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`,
   `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` and `ZCODE_STORAGE_DIR` inside the app's own config dir,
-  so an installed ZCode is never touched.
-- In the project's sandbox: the same, with the agent and its files uploaded to
-  `/craft-anything/agent` at sandbox setup and Node 22 installed there if the template's is older.
+  so an installed ZCode is never touched. Node 22.5+ is needed (the agent uses `node:sqlite`);
+  a `node/node.exe` beside the copy wins over PATH.
+- In the project's sandbox: the same, with everything fetched into the sandbox at setup — see
+  `docs/zcode-agent.md` and `docs/e2b-sandboxes.md`.
 
 ## The "free built-in" provider
 
-- If the machine has Z.ai credentials (`.z-ai-config`), the app starts `zai-bridge.cjs` and the
-  agent's provider config points at it — no key asked for.
+- If the machine has Z.ai credentials (`.z-ai-config`), the app starts `zai-bridge.cjs` beside
+  the local copy and the agent's provider config points at it — no key asked for.
 - Otherwise, save a Z.ai API key for ZCode in Settings → AI; the agent's provider config then
   points straight at `https://api.z.ai/api/paas/v4`.

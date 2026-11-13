@@ -345,6 +345,7 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
     let (mut save_key, mut forget_key) = (None, None);
     // The cloud sandbox: settings changes, per-AI "where does it build", and the key test.
     let mut sandbox_cfg: Option<craft_anything_ai::sandbox::SandboxConfig> = None;
+    let mut zcode_dir_save: Option<String> = None;
     let mut sandbox_mode: Option<(String, Option<bool>)> = None;
     let mut sandbox_test = false;
     // The AI whose Remove was pressed once: asked again before its key is deleted.
@@ -768,7 +769,7 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                 });
             });
         });
-        row(ui, "Template", "What a new sandbox starts from (a Debian image with Node, Python and git).", |ui| {
+        row(ui, "Template", "What a new sandbox starts from. The ZCode template (e2b-template/ in the fork, built with its build.sh) carries the agent, Node 22 and all the tools; \"base\" is E2B's plain Debian image.", |ui| {
             let id = egui::Id::new("sandbox-template");
             let saved = cfg.template.clone();
             let mut text = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(|| saved.clone());
@@ -816,17 +817,90 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                 sandbox_cfg = Some(cfg.clone());
             }
         });
-        row(ui, "Z.ai credentials in the sandbox", "Let the bundled ZCode agent use this machine's Z.ai credentials there (copied into the sandbox's /etc at setup, and nowhere else).", |ui| {
+        row(ui, "Z.ai credentials in the sandbox", "Let the ZCode agent use this machine's Z.ai credentials there (copied into the sandbox's /etc at setup, and nowhere else) — the free built-in route.", |ui| {
             let mut on = cfg.provide_zai_credentials;
             if widgets::toggle(ui, &mut on, "Copy").changed() {
                 cfg.provide_zai_credentials = on;
                 sandbox_cfg = Some(cfg.clone());
             }
         });
+        row(ui, "ZCode agent URL", "Where a sandbox fetches the ZCode agent bundle from, when the template doesn't carry it. Empty uses the agent repository's release.", |ui| {
+            let id = egui::Id::new("sandbox-zcode-agent-url");
+            let saved = cfg.zcode_agent_url.clone().unwrap_or_default();
+            let mut text = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(|| saved.clone());
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .id(id)
+                    .desired_width(300.0)
+                    .hint_text(tr("https://…/zcode-agent-bundle.tar.gz"))
+                    .frame(widgets::text_field_frame_compact(&t)),
+            );
+            if r.changed() {
+                ui.data_mut(|d| d.insert_temp(id, text.clone()));
+            }
+            if r.lost_focus() && text.trim() != saved {
+                cfg.zcode_agent_url = (!text.trim().is_empty()).then(|| text.trim().to_string());
+                sandbox_cfg = Some(cfg.clone());
+            }
+        });
+        row(ui, "ZCode repo token", "The sandbox's way into a private agent repository (a fine-grained or classic GitHub token). It is used inside the sandbox alone.", |ui| {
+            let has_token = app.backend_keys.as_ref().and_then(|keys| keys.get(craft_anything_ai::keys::AGENT_TOKEN).copied()) == Some(true);
+            ui.add_enabled_ui(!app.backend_key_pending.contains(craft_anything_ai::keys::AGENT_TOKEN), |ui| {
+                if has_token {
+                    ui.horizontal_wrapped(|ui| {
+                        widgets::pill(ui, "Token saved", t.success, t.raised);
+                        if widgets::secondary(ui, None, "Forget the token").clicked() {
+                            forget_key = Some(craft_anything_ai::keys::AGENT_TOKEN.to_string());
+                        }
+                    });
+                }
+                let token = key_drafts.entry(craft_anything_ai::keys::AGENT_TOKEN.to_string()).or_default();
+                ui.horizontal_wrapped(|ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(token)
+                            .password(true)
+                            .hint_text(tr("GitHub token for the agent's repository"))
+                            .desired_width(260.0)
+                            .frame(widgets::text_field_frame_compact(&t)),
+                    );
+                    widgets::named(r, "ZCode repo token");
+                    let k = token.trim().to_string();
+                    if widgets::primary_icon(ui, None, "Save", !k.is_empty()).clicked() && !k.is_empty() {
+                        save_key = Some((craft_anything_ai::keys::AGENT_TOKEN.to_string(), k));
+                    }
+                });
+            });
+        });
+    });
+
+    // The ZCode agent's local copy, when the person keeps one: where a non-sandbox run finds
+    // zcode.cjs (Node 22+). Sandboxes fetch the agent themselves; nothing has to be here.
+    ui.add_space(12.0);
+    row(ui, "ZCode agent folder", "A folder on this computer holding zcode.cjs, for runs outside the sandbox (optional).", |ui| {
+        let id = egui::Id::new("zcode-agent-folder");
+        let saved = app.hub.zcode_agent_dir().unwrap_or_default();
+        let mut text = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(|| saved.clone());
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .id(id)
+                .desired_width(300.0)
+                .hint_text(tr("C:\\tools\\zcode  (or a folder with zcode.cjs)"))
+                .frame(widgets::text_field_frame_compact(&t)),
+        );
+        if r.changed() {
+            ui.data_mut(|d| d.insert_temp(id, text.clone()));
+        }
+        if r.lost_focus() && text.trim() != saved {
+            zcode_dir_save = Some(text.trim().to_string());
+        }
     });
 
     // Drafts the rows typed into go back to the app; the sandbox key's keeps its own name.
-    key_drafts.retain(|name, _| app.backends.iter().any(|backend| &backend.name == name) || name == craft_anything_ai::keys::SANDBOX_KEY);
+    key_drafts.retain(|name, _| {
+        app.backends.iter().any(|backend| &backend.name == name)
+            || name == craft_anything_ai::keys::SANDBOX_KEY
+            || name == craft_anything_ai::keys::AGENT_TOKEN
+    });
     app.backend_key_inputs = key_drafts;
     app.folder_inputs = folder_drafts;
     if let Some((name, key)) = save_key {
@@ -897,6 +971,9 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
     }
     if let Some(cfg) = sandbox_cfg {
         app.set_sandbox(cfg);
+    }
+    if let Some(dir) = zcode_dir_save {
+        app.set_zcode_agent_dir(&dir);
     }
     if let Some((name, mode)) = sandbox_mode {
         app.set_backend_sandbox(&name, mode);

@@ -4,10 +4,11 @@
 //! serves a whole conversation; its own tools (Bash, Read, Write, Edit…) work on the project's
 //! folder wherever the server runs, here or in the project's sandbox.
 //!
-//! Its "GLM (built-in)" provider is either the local bridge (`zai-bridge.cjs`, when this computer
-//! has Z.ai credentials it may use) or a Z.ai API key saved for this backend in Settings → AI.
-//! The agent and its config ship with the app under `resources/zcode/`; a Node 22 runtime is
-//! bundled there too when the app is built for release (see `packaging/`).
+//! The agent is not shipped with the app: on this computer it is whatever copy the person points
+//! Settings → AI at (or finds through `CRAFT_ANYTHING_ZCODE_DIR`), and in the project's sandbox it
+//! is fetched there at setup — from the sandbox template that carries it, or straight from the
+//! agent's release. Its "GLM (built-in)" provider is either the bridge (`zai-bridge.cjs`, next to
+//! the agent, fed by Z.ai credentials) or a Z.ai API key saved for this backend in Settings → AI.
 
 use super::acp;
 use super::adapters::{AgentAdapter, ArgsCx};
@@ -39,9 +40,19 @@ pub const BRIDGE_PORT: u16 = 3031;
 /// The provider and model the bridge serves.
 pub const BRIDGE_PROVIDER: &str = "zai-bridge";
 pub const BRIDGE_MODEL: &str = "zai-glm";
-/// The direct Z.ai endpoint, when a key is saved instead.
+/// The direct Z.ai endpoint, when a key is saved instead, and the model it serves.
 pub const ZAI_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 pub const ZAI_MODEL: &str = "glm-4.6";
+/// Where a sandbox fetches the agent bundle from, when its template doesn't carry it and this app
+/// doesn't hold a copy: the agent repository's release listing. The app resolves it to the
+/// bundle's asset and the sandbox downloads that. A private repository needs a token saved in
+/// Settings → AI → Sandbox (`sandbox:zcode-token`): GitHub's download pages answer 404 to a bare
+/// token there, while the API's asset endpoint (octet-stream) serves the file.
+pub const DEFAULT_AGENT_URL: &str = "https://api.github.com/repos/Zetsu4i/zcode-agent-core/releases/latest";
+/// The asset looked for in the release listing.
+pub const AGENT_BUNDLE_ASSET: &str = "zcode-agent-bundle.tar.gz";
+/// The repository the default listing points at, when a custom URL doesn't name one.
+pub const DEFAULT_AGENT_REPO: &str = "Zetsu4i/zcode-agent-core";
 
 /// The runtime preferences the app answers `session/requestRuntimePreferences` with.
 fn runtime_preferences() -> Value {
@@ -58,7 +69,24 @@ pub fn app_data_dir() -> PathBuf {
     craft_anything_engine::settings::config_dir().join("zcode")
 }
 
-/// The folder the bundled agent lives in, when this app carries it.
+/// The ZCode agent folder in the settings file (`[ai] zcode_dir = "…"`), when it was set.
+pub(crate) fn settings_zcode_dir() -> Option<String> {
+    let table = craft_anything_engine::Settings::load().ai;
+    table.get("zcode_dir").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Where a copy of the agent lives on this computer, in the order the person's words win:
+/// the folder Settings → AI names, then `CRAFT_ANYTHING_ZCODE_DIR`, then the app-side folder a
+/// development build or a hand-assembled package carries. `None` means there is no local copy —
+/// the agent then runs only in the project's sandbox.
+pub fn local_agent_dir(explicit: Option<&str>) -> Option<PathBuf> {
+    let mut candidates = explicit.map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from).into_iter().chain(
+        std::env::var("CRAFT_ANYTHING_ZCODE_DIR").ok().map(PathBuf::from).into_iter().chain(assets().into_iter()),
+    );
+    candidates.find(|dir| dir.join("zcode.cjs").is_file())
+}
+
+/// The folder the app itself carries, when a build bundled the agent (development runs).
 pub fn assets() -> Option<PathBuf> {
     if let Ok(env_dir) = std::env::var("CRAFT_ANYTHING_ZCODE_DIR")
         && Path::new(&env_dir).join("zcode.cjs").is_file()
@@ -70,23 +98,19 @@ pub fn assets() -> Option<PathBuf> {
     [dir.join("resources").join("zcode"), dir.join("zcode")].into_iter().find(|candidate| candidate.join("zcode.cjs").is_file())
 }
 
-/// The agent's builtin provider catalogue, bundled with the app.
-pub fn builtin_config_bytes() -> Option<Vec<u8>> {
-    let dir = assets()?;
+/// The agent's builtin provider catalogue, beside the local copy of the agent when there is one.
+pub fn builtin_config_bytes(dir: Option<&Path>) -> Option<Vec<u8>> {
+    let dir = dir.map(PathBuf::from).or_else(assets)?;
     std::fs::read(dir.join("config").join("zcode-builtin.json")).ok()
 }
 
-/// Whether everything the ZCode agent needs in a sandbox is bundled with this app.
-pub fn sandbox_env_ready() -> bool {
-    assets().is_some() && builtin_config_bytes().is_some()
-}
-
-/// A Node runtime: the bundled one (22), else `node` on this computer. `command` overrides both.
+/// A Node runtime: the one beside the local copy of the agent, else `node` on this computer.
+/// `command` overrides both.
 fn node_program(command: Option<&str>) -> String {
     if let Some(cmd) = command.map(str::trim).filter(|c| !c.is_empty()) {
         return cmd.to_string();
     }
-    if let Some(dir) = assets() {
+    if let Some(dir) = local_agent_dir(settings_zcode_dir().as_deref()) {
         for name in ["node.exe", "node"] {
             let bundled = dir.join("node").join(name);
             if bundled.is_file() {
@@ -128,7 +152,7 @@ pub fn ensure_bridge() {
     if agent.get(format!("http://127.0.0.1:{BRIDGE_PORT}/health")).call().is_ok_and(|r| r.status().as_u16() / 100 == 2) {
         return;
     }
-    let Some(dir) = assets() else { return };
+    let Some(dir) = local_agent_dir(settings_zcode_dir().as_deref()) else { return };
     let node = node_program(None);
     if let Ok(proc) = Process::new(&node)
         .args([&dir.join("zai-bridge.cjs").display().to_string()])
@@ -188,17 +212,18 @@ fn provider_config_json(provider: &str, model: &str, base_url: &str, api_key: &s
     })
 }
 
-/// The provider config the agent is pointed at (`ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`): the
-/// bridge when Z.ai credentials are on this computer and no key was saved, else the direct Z.ai
-/// endpoint with the saved key. Written under the app's own config dir, never logged.
-pub fn ensure_provider_config(store: &KeyStore, backend_name: &str) -> Result<PathBuf, ToolError> {
+/// The provider config the agent is pointed at (`ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`) and the
+/// route it takes: the bridge when Z.ai credentials are on this computer and no key was saved,
+/// else the direct Z.ai endpoint with the saved key. Written under the app's own config dir,
+/// never logged.
+pub fn ensure_provider_config(store: &KeyStore, backend_name: &str) -> Result<(PathBuf, Route), ToolError> {
     let dir = app_data_dir();
     std::fs::create_dir_all(&dir).map_err(|e| ToolError::io(dir.display(), e))?;
     let path = dir.join("provider_config.json");
     let saved_key = store.get(backend_name).map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
-    let (model, base_url, api_key) = match saved_key {
-        Some(key) => (BRIDGE_MODEL.to_string(), ZAI_BASE_URL.to_string(), key),
-        None if z_ai_config_present() => (BRIDGE_MODEL.to_string(), format!("http://127.0.0.1:{BRIDGE_PORT}/llm/v1"), "builtin".to_string()),
+    let route = match saved_key {
+        Some(key) => Route::Direct(key),
+        None if z_ai_config_present() => Route::Bridge,
         None => {
             return Err(ToolError::new(
                 ErrorCode::BadSettings,
@@ -209,15 +234,37 @@ pub fn ensure_provider_config(store: &KeyStore, backend_name: &str) -> Result<Pa
             )));
         }
     };
-    craft_anything_platform::write_atomic_private(&path, provider_config_json(BRIDGE_PROVIDER, &model, &base_url, &api_key).to_string().as_bytes())?;
-    Ok(path)
+    craft_anything_platform::write_atomic_private(&path, provider_config_for(&route).as_bytes())?;
+    Ok((path, route))
 }
 
-/// The provider config for a run inside the sandbox: the bridge there, reachable only when the
-/// person let their Z.ai credentials travel (they are written to the sandbox's `/etc/.z-ai-config`
-/// at setup, and nothing else carries them).
-pub fn sandbox_provider_config() -> Result<String, ToolError> {
-    Ok(provider_config_json(BRIDGE_PROVIDER, BRIDGE_MODEL, &format!("http://127.0.0.1:{BRIDGE_PORT}/llm/v1"), "builtin").to_string())
+/// The route the agent's GLM provider takes, decided once per run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// The bridge next to the agent: the free built-in route, fed by Z.ai credentials that were
+    /// found on this machine or travel to the sandbox separately.
+    Bridge,
+    /// The saved Z.ai key, straight to the endpoint. The key is written into the provider config
+    /// alone (the app's config dir here, the sandbox's agent folder there).
+    Direct(String),
+}
+
+impl Route {
+    /// The model the agent is told to use: the bridge's own name, or the endpoint's real one.
+    pub fn model(&self) -> &str {
+        match self {
+            Route::Bridge => BRIDGE_MODEL,
+            Route::Direct(_) => ZAI_MODEL,
+        }
+    }
+}
+
+/// The provider config for a route, as the agent reads it (`ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`).
+pub fn provider_config_for(route: &Route) -> String {
+    match route {
+        Route::Bridge => provider_config_json(BRIDGE_PROVIDER, BRIDGE_MODEL, &format!("http://127.0.0.1:{BRIDGE_PORT}/llm/v1"), "builtin").to_string(),
+        Route::Direct(key) => provider_config_json(BRIDGE_PROVIDER, ZAI_MODEL, ZAI_BASE_URL, key).to_string(),
+    }
 }
 
 /// How the agent is driven as a registered adapter. Conversations with it go through
@@ -283,6 +330,8 @@ pub struct ZcodeCore {
     backend: String,
     workspace: String,
     mode: String,
+    /// The model the session talks to, from the route the provider config takes.
+    model: String,
     next_id: u64,
     phase: Phase,
     session: Option<String>,
@@ -301,11 +350,12 @@ pub struct ZcodeCore {
 }
 
 impl ZcodeCore {
-    pub fn new(backend: &str, workspace: &Path, builder: bool, resume: Option<String>) -> Self {
+    pub fn new(backend: &str, workspace: &Path, builder: bool, resume: Option<String>, model: String) -> Self {
         ZcodeCore {
             backend: backend.to_string(),
             workspace: workspace.display().to_string(),
             mode: if builder { "build".into() } else { "plan".into() },
+            model,
             next_id: 0,
             phase: Phase::Starting,
             session: None,
@@ -345,6 +395,7 @@ impl ZcodeCore {
 
     fn create_session(&mut self, out: &mut Vec<Out>) {
         self.phase = Phase::Creating;
+        let model = json!({ "providerId": BRIDGE_PROVIDER, "modelId": self.model, "options": { "reasoningLevel": "enabled" } });
         if let Some(saved) = self.resume.take() {
             self.send("session/resume", json!({ "sessionId": saved }), "resume", out);
         } else {
@@ -353,7 +404,7 @@ impl ZcodeCore {
                 json!({
                     "workspace": { "workspacePath": self.workspace, "workspaceKey": self.workspace },
                     "mode": self.mode,
-                    "model": { "providerId": BRIDGE_PROVIDER, "modelId": BRIDGE_MODEL, "options": { "reasoningLevel": "enabled" } },
+                    "model": model,
                     "persistence": "immediate",
                 }),
                 "create",
@@ -388,7 +439,7 @@ impl ZcodeCore {
             json!({
                 "sessionId": session,
                 "content": text,
-                "modelSelection": { "providerId": BRIDGE_PROVIDER, "modelId": BRIDGE_MODEL, "options": { "reasoningLevel": "enabled" } },
+                "modelSelection": { "providerId": BRIDGE_PROVIDER, "modelId": self.model, "options": { "reasoningLevel": "enabled" } },
             }),
             "send",
             out,
@@ -657,6 +708,10 @@ pub struct ZcodeConversation {
     failure: Option<TurnFailure>,
     /// The project the sandbox's files come back to.
     project_root: PathBuf,
+    /// A local copy of the agent the settings name, taken once at the start.
+    zcode_dir: Option<String>,
+    /// The model the session talks to, from the route the run took (set when it starts).
+    model: Option<String>,
 }
 
 impl ZcodeConversation {
@@ -683,6 +738,8 @@ impl ZcodeConversation {
             lost: Arc::default(),
             failure: None,
             project_root: workspace,
+            zcode_dir: settings_zcode_dir(),
+            model: None,
         }
     }
 
@@ -690,35 +747,51 @@ impl ZcodeConversation {
         self.shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The agent's command line: its Node runtime, its entry, the app-server subcommand.
-    fn argv(&self, in_sandbox: bool) -> Vec<String> {
+    /// The agent's command line: its Node runtime, its entry, the app-server subcommand. A run on
+    /// this computer needs a local copy of the agent; the sandbox's entry is where setup puts it.
+    fn argv(&self, in_sandbox: bool) -> Result<Vec<String>, ToolError> {
         let node = if in_sandbox { "node".to_string() } else { node_program(None) };
         let entry = if in_sandbox {
             format!("{}/agent/zcode.cjs", self.sandbox.as_ref().map(|s| s.remote_root.as_str()).unwrap_or("/craft-anything"))
         } else {
-            assets().map(|d| d.join("zcode.cjs").display().to_string()).unwrap_or_else(|| "zcode.cjs".into())
+            let dir = local_agent_dir(self.zcode_dir.as_deref()).ok_or_else(|| {
+                ToolError::new(
+                    ErrorCode::EngineMissing,
+                    "The ZCode agent isn't on this computer, and the app doesn't carry it.",
+                )
+                .with_remediation(format!(
+                    "Point Settings → AI → ZCode agent folder at the folder holding zcode.cjs (it runs on Node 22+), or turn on the cloud sandbox in Settings → AI → Sandbox: the agent is set up there, and never has to be on this computer."
+                ))
+            })?;
+            dir.join("zcode.cjs").display().to_string()
         };
-        vec![node, entry, "app-server".into(), "--stdio".into()]
+        Ok(vec![node, entry, "app-server".into(), "--stdio".into()])
     }
 
     /// The environment the agent needs, for a run on this computer: its provider catalogue and
-    /// the personal provider config the app generates.
-    fn local_env(&self, store: &KeyStore) -> Result<Vec<(String, String)>, ToolError> {
+    /// the personal provider config the app generates. Returns the route the config took, so the
+    /// session asks for the model that route serves.
+    fn local_env(&self, store: &KeyStore) -> Result<(Vec<(String, String)>, Route), ToolError> {
         let dir = app_data_dir();
-        let personal = ensure_provider_config(store, &self.agent)?;
-        let mut env = vec![
+        let (personal, route) = ensure_provider_config(store, &self.agent)?;
+        let agent_dir = local_agent_dir(self.zcode_dir.as_deref());
+        let builtin = agent_dir.as_deref().and_then(|d| builtin_config_bytes(Some(d))).ok_or_else(|| {
+            ToolError::new(ErrorCode::EngineMissing, "The ZCode agent's provider catalogue is missing.")
+                .with_remediation(format!(
+                    "The folder Settings → AI → ZCode agent folder points at needs config/zcode-builtin.json beside zcode.cjs. The sandbox route doesn't need a local copy at all: Settings → AI → Sandbox turns it on."
+                ))
+        })?;
+        let config_dir = dir.join("config");
+        std::fs::create_dir_all(&config_dir).map_err(|e| ToolError::io(config_dir.display(), e))?;
+        let config_path = config_dir.join("zcode-builtin.json");
+        craft_anything_platform::write_atomic_private(&config_path, &builtin)?;
+        let env = vec![
             ("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE".to_string(), personal.display().to_string()),
+            ("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE".to_string(), config_path.display().to_string()),
             ("ZCODE_STORAGE_DIR".to_string(), dir.join("home").display().to_string()),
             (craft_anything_engine::AGENT_ENV.to_string(), "1".to_string()),
         ];
-        if let Some(bytes) = builtin_config_bytes() {
-            let config_dir = dir.join("config");
-            std::fs::create_dir_all(&config_dir).map_err(|e| ToolError::io(config_dir.display(), e))?;
-            let path = config_dir.join("zcode-builtin.json");
-            craft_anything_platform::write_atomic_private(&path, &bytes)?;
-            env.push(("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE".to_string(), path.display().to_string()));
-        }
-        Ok(env)
+        Ok((env, route))
     }
 
     /// The environment for a run inside the sandbox: same names, the sandbox's own paths.
@@ -736,23 +809,31 @@ impl ZcodeConversation {
     /// Start the app-server: here, or inside the project's sandbox.
     fn spawn(&mut self, store: &KeyStore) -> Result<(), ToolError> {
         let sandboxed = self.sandbox.is_some();
-        let argv = self.argv(sandboxed);
+        let argv = self.argv(sandboxed)?;
         let workspace = self.sandbox.as_ref().map(|s| s.remote_root.clone()).unwrap_or_else(|| self.workspace.display().to_string());
         let resume = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        {
-            let mut g = self.lock();
-            *g = Some(Shared {
-                core: ZcodeCore::new(&self.backend, Path::new(&workspace), self.builder, resume),
-                stdin: None,
-                remote: None,
-                approver: self.approver.clone(),
-            });
-        }
         let mut outs = Vec::new();
         if let Some(sb) = self.sandbox.clone() {
-            if !sandbox_env_ready() {
-                return Err(ToolError::new(ErrorCode::EngineMissing, "The ZCode agent isn't bundled with this app, so it can't run in the sandbox.")
-                    .with_remediation("Use a release that bundles it, or turn the sandbox off for this builder."));
+            // Setup wrote the route the sandbox's provider config takes; the session asks for the
+            // model it serves. Without it, setup never got to the agent.
+            let model = sb
+                .zcode_model
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| {
+                    ToolError::new(ErrorCode::EngineMissing, "The sandbox's ZCode agent setup didn't finish, so there is no model route yet.")
+                        .with_remediation("Start the build again: the sandbox sets itself up on its own.")
+                })?;
+            self.model = Some(model.clone());
+            {
+                let mut g = self.lock();
+                *g = Some(Shared {
+                    core: ZcodeCore::new(&self.backend, Path::new(&workspace), self.builder, resume, model),
+                    stdin: None,
+                    remote: None,
+                    approver: self.approver.clone(),
+                });
             }
             let envd = sb.envd()?;
             let env: BTreeMap<String, String> = self.sandbox_env(&sb).into_iter().collect();
@@ -773,7 +854,17 @@ impl ZcodeConversation {
             }
             return Ok(());
         }
-        let env = self.local_env(store)?;
+        let (env, route) = self.local_env(store)?;
+        self.model = Some(route.model().to_string());
+        {
+            let mut g = self.lock();
+            *g = Some(Shared {
+                core: ZcodeCore::new(&self.backend, Path::new(&workspace), self.builder, resume, route.model().to_string()),
+                stdin: None,
+                remote: None,
+                approver: self.approver.clone(),
+            });
+        }
         // The machine's Z.ai credentials may be what serves the model: the bridge goes up first.
         ensure_bridge();
         let (shared, tx, busy) = (self.shared.clone(), self.tx.clone(), self.busy.clone());
@@ -994,7 +1085,7 @@ mod tests {
     use super::*;
 
     fn core() -> ZcodeCore {
-        ZcodeCore::new("Test", Path::new("/proj"), false, None)
+        ZcodeCore::new("Test", Path::new("/proj"), false, None, BRIDGE_MODEL.to_string())
     }
 
     /// The handshake: storage ready → session/create (with the workspace and the built-in model)
@@ -1110,7 +1201,7 @@ mod tests {
     /// A resume the agent can't honour is flagged, so the caller starts fresh rather than blind.
     #[test]
     fn a_missing_resumed_session_is_flagged() {
-        let mut c = ZcodeCore::new("Test", Path::new("/proj"), false, Some("sess-gone".into()));
+        let mut c = ZcodeCore::new("Test", Path::new("/proj"), false, Some("sess-gone".into()), BRIDGE_MODEL.to_string());
         let mut out = c.start();
         c.line(json!({"method": "startup/storageState", "params": {"phase": "ready"}}).to_string().as_str(), &mut out);
         let resume = serde_json::from_str::<Value>(out[0].send_text()).unwrap();
