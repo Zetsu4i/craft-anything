@@ -291,7 +291,9 @@ impl Sandbox {
                 ErrorCode::EngineMissing,
                 "The sandbox has no tool server: none was bundled with this app and the sandbox couldn't fetch one.",
             )
-            .with_remediation(format!("Check the sandbox's internet access, or ship `resources/sandbox/craft-anything-cli-linux` beside the app (looked at {url}).")));
+            .with_remediation(format!(
+                "Check the sandbox's internet access, or ship `resources/sandbox/craft-anything-cli-linux` beside the app (looked at {url})."
+            )));
         }
         Ok(())
     }
@@ -300,7 +302,9 @@ impl Sandbox {
     /// bundle fetched by the sandbox itself), the provider route, and the bridge behind the free
     /// built-in provider when Z.ai credentials serve it.
     fn setup_zcode(&self, envd: &Envd, status: &mut dyn FnMut(String), zc: &ZcodeSetup) -> Result<(), ToolError> {
-        let have_agent = e2b::run_command(envd, &format!("test -f {REMOTE_AGENT}/zcode.cjs -a -f {REMOTE_AGENT}/config/zcode-builtin.json"), Duration::from_secs(60)).is_ok();
+        let have_agent =
+            e2b::run_command(envd, &format!("test -f {REMOTE_AGENT}/zcode.cjs -a -f {REMOTE_AGENT}/config/zcode-builtin.json"), Duration::from_secs(60))
+                .is_ok();
         if !have_agent {
             let mut uploaded = false;
             if let Some(dir) = crate::cli_agents::zcode::assets() {
@@ -369,8 +373,11 @@ impl Sandbox {
                      echo 'the GLM bridge did not come up'; tail -5 {REMOTE_AGENT}/bridge.log 2>/dev/null; exit 1",
                 );
                 if let Err(e) = e2b::run_command(envd, &cmd, Duration::from_secs(120)) {
-                    return Err(ToolError::new(ErrorCode::EngineMissing, "The sandbox's GLM bridge didn't start, so the free built-in provider can't serve the model.")
-                        .with_remediation(format!("Its log is {REMOTE_AGENT}/bridge.log in the sandbox. {}", first_line(&e.message))));
+                    return Err(ToolError::new(
+                        ErrorCode::EngineMissing,
+                        "The sandbox's GLM bridge didn't start, so the free built-in provider can't serve the model.",
+                    )
+                    .with_remediation(format!("Its log is {REMOTE_AGENT}/bridge.log in the sandbox. {}", first_line(&e.message))));
                 }
             }
         }
@@ -395,14 +402,12 @@ impl Sandbox {
         // sandbox then downloads the asset itself. Anything already pointing at a file is used
         // as it is. octet-stream is what makes the API's asset endpoint hand over bytes.
         let (fetch_url, octet) = if url.contains("api.github.com") && !url.contains("/releases/assets/") {
-            let listing = e2b::run_command(envd, &format!("curl -fsSL{auth} '{url}'"), Duration::from_secs(120))
-                .map_err(|e| {
-                    ToolError::new(ErrorCode::EngineMissing, "The agent repository's release couldn't be reached.")
-                        .with_remediation(format!(
-                            "If the repository is private, save its access token in Settings → AI → Sandbox (ZCode repo token). The listing URL was {url} ({})",
-                            first_line(&e.message)
-                        ))
-                })?;
+            let listing = e2b::run_command(envd, &format!("curl -fsSL{auth} '{url}'"), Duration::from_secs(120)).map_err(|e| {
+                ToolError::new(ErrorCode::EngineMissing, "The agent repository's release couldn't be reached.").with_remediation(format!(
+                    "If the repository is private, save its access token in Settings → AI → Sandbox (ZCode repo token). The listing URL was {url} ({})",
+                    first_line(&e.message)
+                ))
+            })?;
             let id = listing
                 .rsplit_once(&format!("\"name\": \"{}\"", crate::cli_agents::zcode::AGENT_BUNDLE_ASSET))
                 .and_then(|(before, _)| before.rsplit_once("\"id\": "))
@@ -410,14 +415,12 @@ impl Sandbox {
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| {
                     ToolError::new(ErrorCode::EngineMissing, format!("The release at {url} holds no {} asset.", crate::cli_agents::zcode::AGENT_BUNDLE_ASSET))
-                        .with_remediation("Upload the bundle to the release (or point Settings → AI → Sandbox → ZCode agent URL at a direct file URL), then try again.")
+                        .with_remediation(
+                            "Upload the bundle to the release (or point Settings → AI → Sandbox → ZCode agent URL at a direct file URL), then try again.",
+                        )
                 })?;
             // The asset lives under the listing's own repository, whatever the settings named.
-            let repo = url
-                .split("/repos/")
-                .nth(1)
-                .and_then(|r| r.split("/releases").next())
-                .unwrap_or(crate::cli_agents::zcode::DEFAULT_AGENT_REPO);
+            let repo = url.split("/repos/").nth(1).and_then(|r| r.split("/releases").next()).unwrap_or(crate::cli_agents::zcode::DEFAULT_AGENT_REPO);
             (format!("https://api.github.com/repos/{repo}/releases/assets/{id}"), true)
         } else {
             (url.clone(), url.contains("api.github.com"))
@@ -429,8 +432,9 @@ impl Sandbox {
              test -f {REMOTE_AGENT}/zcode.cjs",
         );
         if e2b::run_command(envd, &cmd, Duration::from_secs(600)).is_err() {
-            return Err(ToolError::new(ErrorCode::EngineMissing, "The sandbox couldn't fetch the ZCode agent.")
-                .with_remediation(format!("If the agent's repository is private, save its access token in Settings → AI → Sandbox (ZCode repo token), and check the URL: {url}")));
+            return Err(ToolError::new(ErrorCode::EngineMissing, "The sandbox couldn't fetch the ZCode agent.").with_remediation(format!(
+                "If the agent's repository is private, save its access token in Settings → AI → Sandbox (ZCode repo token), and check the URL: {url}"
+            )));
         }
         Ok(())
     }

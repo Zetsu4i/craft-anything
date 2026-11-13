@@ -897,9 +897,7 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
 
     // Drafts the rows typed into go back to the app; the sandbox key's keeps its own name.
     key_drafts.retain(|name, _| {
-        app.backends.iter().any(|backend| &backend.name == name)
-            || name == craft_anything_ai::keys::SANDBOX_KEY
-            || name == craft_anything_ai::keys::AGENT_TOKEN
+        app.backends.iter().any(|backend| &backend.name == name) || name == craft_anything_ai::keys::SANDBOX_KEY || name == craft_anything_ai::keys::AGENT_TOKEN
     });
     app.backend_key_inputs = key_drafts;
     app.folder_inputs = folder_drafts;

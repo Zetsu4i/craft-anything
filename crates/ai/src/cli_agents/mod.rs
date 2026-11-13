@@ -1002,7 +1002,7 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     let (help, needed) = adapter.required_flags();
     if !needed.is_empty() {
         let checked = match remote {
-            Some(_) => Some(true), // can't cheaply check a remote CLI; its errors are streamed back
+            Some(_) => Some(true),                        // can't cheaply check a remote CLI; its errors are streamed back
             None if spec.sandbox.is_some() => Some(true), // the same for a run in the project's sandbox
             None => {
                 // Only a help with the flags is kept: anything else is checked again next turn, so
@@ -1185,9 +1185,8 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         };
         // A ZCode builder's sandbox gets the agent and its provider route at setup; the saved
         // key (if there is one) travels as the direct route, the credentials as the bridge's.
-        let zcode_setup = (spec.config.model == zcode::AGENT_ID).then(|| crate::sandbox::ZcodeSetup {
-            api_key: crate::keys::KeyStore::system().get(&spec.config.name),
-        });
+        let zcode_setup =
+            (spec.config.model == zcode::AGENT_ID).then(|| crate::sandbox::ZcodeSetup { api_key: crate::keys::KeyStore::system().get(&spec.config.name) });
         if let Err(e) = sb.sync_up(&project_root, &mut status, zcode_setup.as_ref()) {
             let _ = tx.send(AgentEvent::Error { message: e.message, remediation: e.remediation, log: None });
             return nothing_done(&name);

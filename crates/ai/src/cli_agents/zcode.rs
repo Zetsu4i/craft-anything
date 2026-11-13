@@ -80,9 +80,12 @@ pub(crate) fn settings_zcode_dir() -> Option<String> {
 /// development build or a hand-assembled package carries. `None` means there is no local copy —
 /// the agent then runs only in the project's sandbox.
 pub fn local_agent_dir(explicit: Option<&str>) -> Option<PathBuf> {
-    let mut candidates = explicit.map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from).into_iter().chain(
-        std::env::var("CRAFT_ANYTHING_ZCODE_DIR").ok().map(PathBuf::from).into_iter().chain(assets().into_iter()),
-    );
+    let mut candidates = explicit
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(std::env::var("CRAFT_ANYTHING_ZCODE_DIR").ok().map(PathBuf::from).into_iter().chain(assets().into_iter()));
     candidates.find(|dir| dir.join("zcode.cjs").is_file())
 }
 
@@ -816,15 +819,10 @@ impl ZcodeConversation {
         if let Some(sb) = self.sandbox.clone() {
             // Setup wrote the route the sandbox's provider config takes; the session asks for the
             // model it serves. Without it, setup never got to the agent.
-            let model = sb
-                .zcode_model
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-                .ok_or_else(|| {
-                    ToolError::new(ErrorCode::EngineMissing, "The sandbox's ZCode agent setup didn't finish, so there is no model route yet.")
-                        .with_remediation("Start the build again: the sandbox sets itself up on its own.")
-                })?;
+            let model = sb.zcode_model.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().ok_or_else(|| {
+                ToolError::new(ErrorCode::EngineMissing, "The sandbox's ZCode agent setup didn't finish, so there is no model route yet.")
+                    .with_remediation("Start the build again: the sandbox sets itself up on its own.")
+            })?;
             self.model = Some(model.clone());
             {
                 let mut g = self.lock();
