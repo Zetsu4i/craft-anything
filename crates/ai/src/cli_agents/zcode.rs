@@ -85,7 +85,7 @@ pub fn local_agent_dir(explicit: Option<&str>) -> Option<PathBuf> {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .into_iter()
-        .chain(std::env::var("CRAFT_ANYTHING_ZCODE_DIR").ok().map(PathBuf::from).into_iter().chain(assets().into_iter()));
+        .chain(std::env::var("CRAFT_ANYTHING_ZCODE_DIR").ok().map(PathBuf::from).into_iter().chain(assets()));
     candidates.find(|dir| dir.join("zcode.cjs").is_file())
 }
 
@@ -762,9 +762,7 @@ impl ZcodeConversation {
                     ErrorCode::EngineMissing,
                     "The ZCode agent isn't on this computer, and the app doesn't carry it.",
                 )
-                .with_remediation(format!(
-                    "Point Settings → AI → ZCode agent folder at the folder holding zcode.cjs (it runs on Node 22+), or turn on the cloud sandbox in Settings → AI → Sandbox: the agent is set up there, and never has to be on this computer."
-                ))
+                .with_remediation("Point Settings → AI → ZCode agent folder at the folder holding zcode.cjs (it runs on Node 22+), or turn on the cloud sandbox in Settings → AI → Sandbox: the agent is set up there, and never has to be on this computer.".to_string())
             })?;
             dir.join("zcode.cjs").display().to_string()
         };
@@ -780,9 +778,7 @@ impl ZcodeConversation {
         let agent_dir = local_agent_dir(self.zcode_dir.as_deref());
         let builtin = agent_dir.as_deref().and_then(|d| builtin_config_bytes(Some(d))).ok_or_else(|| {
             ToolError::new(ErrorCode::EngineMissing, "The ZCode agent's provider catalogue is missing.")
-                .with_remediation(format!(
-                    "The folder Settings → AI → ZCode agent folder points at needs config/zcode-builtin.json beside zcode.cjs. The sandbox route doesn't need a local copy at all: Settings → AI → Sandbox turns it on."
-                ))
+                .with_remediation("The folder Settings → AI → ZCode agent folder points at needs config/zcode-builtin.json beside zcode.cjs. The sandbox route doesn't need a local copy at all: Settings → AI → Sandbox turns it on.".to_string())
         })?;
         let config_dir = dir.join("config");
         std::fs::create_dir_all(&config_dir).map_err(|e| ToolError::io(config_dir.display(), e))?;

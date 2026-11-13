@@ -418,7 +418,7 @@ impl Sandbox {
             let id = listing
                 .rsplit_once(&format!("\"name\": \"{}\"", crate::cli_agents::zcode::AGENT_BUNDLE_ASSET))
                 .and_then(|(before, _)| before.rsplit_once("\"id\": "))
-                .and_then(|(_, after)| Some(after.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect::<String>()))
+                .map(|(_, after)| after.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| {
                     ToolError::new(ErrorCode::EngineMissing, format!("The release at {url} holds no {} asset.", crate::cli_agents::zcode::AGENT_BUNDLE_ASSET))
