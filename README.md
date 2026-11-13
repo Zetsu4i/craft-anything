@@ -14,7 +14,7 @@
 <h1 align="center">Craft Anything</h1>
 
 <p align="center">
-  <b>English</b> · <a href="README.ja.md">日本語</a> · <a href="README.zh.md">简体中文</a> · <a href="README.zh-hant.md">繁體中文</a> · <a href="README.ko.md">한국어</a> · <a href="README.es.md">Español</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a> · <a href="README.pt.md">Português</a>
+  <b>English</b> · <a href="README.ja.md">日本語</a> · <a href="README.zh.md">简体中文</a> · <a href="README.zh-hant.md">繁體中文</a> · <a href="README.ko.md">한국어</a> · <a href="README.es.md">Español</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a> · <a href="README.pt.md">Português</a> · <a href="README.th.md">ไทย</a>
 </p>
 
 <p align="center">
@@ -239,7 +239,7 @@ only takes it off the list.
 > **Status:** Craft Anything is in early alpha. What works today, what is partial and what's next:
 >
 > - **Works today:** the desktop app (Simple and Advanced), the CLI and the MCP server; the
->   Study → Build → Check → Refine workflow for websites, apps and games with Claude Code as the
+>   Study → Build → Check → Ready workflow for websites, apps and games with Claude Code as the
 >   builder; website checks at three screen widths; game rebuilds in Unity, Unreal or Godot; Deep
 >   mode with Ghidra; generated pictures and 3D models (opt-in, your own fal.ai key); plugins (MCP
 >   servers, and WASM components in builds with the `wasm-plugins` option).

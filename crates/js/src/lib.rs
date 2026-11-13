@@ -141,7 +141,9 @@ pub fn analyze(path: &str, src: &str, limits: &Limits) -> Analysis {
     f.bytes = src.len();
     f.lines = lines.count();
     if f.source_map_url.is_none() {
-        f.source_map_url = find_map_url(src);
+        // One reader for every path: the formats one accepts the standard spacing after the
+        // marker and rejects a URL containing whitespace.
+        f.source_map_url = craft_anything_formats::sourcemap::find_source_mapping_url(src);
     }
     for v in vendor::marker_vendors(&f.strings) {
         if !f.vendors.iter().any(|x| x.name == v.name) {
@@ -150,22 +152,6 @@ pub fn analyze(path: &str, src: &str, limits: &Limits) -> Analysis {
     }
     analysis.bundle.bundlers = bundle::classify(&f.bundler_markers, &analysis.bundle, &f.strings);
     analysis
-}
-
-fn find_map_url(src: &str) -> Option<String> {
-    // Only terminal comments count, but inline maps can be larger than a short scan window.
-    for line in src.lines().rev().take(8) {
-        let t = line.trim();
-        for p in ["//# sourceMappingURL=", "//@ sourceMappingURL=", "/*# sourceMappingURL="] {
-            if let Some(u) = t.strip_prefix(p) {
-                let u = u.trim_end_matches("*/").trim();
-                if !u.is_empty() {
-                    return Some(u.to_string());
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Most tokens the fallback keeps in memory at once.

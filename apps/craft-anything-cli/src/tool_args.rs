@@ -77,7 +77,7 @@ fn convert(ty: &str, key: &str, raw: &str) -> Result<Value, String> {
                 t.parse::<i64>().map(|n| json!(n)).map_err(|_| format!("--{key} expects a whole number, got {raw:?}"))
             }
         }
-        "number" => raw.trim().parse::<f64>().map(|n| json!(n)).map_err(|_| format!("--{key} expects a number, got {raw:?}")),
+        "number" => raw.trim().parse::<f64>().ok().filter(|n| n.is_finite()).map(|n| json!(n)).ok_or_else(|| format!("--{key} expects a number, got {raw:?}")),
         "boolean" => match raw.trim() {
             "true" | "yes" | "1" => Ok(json!(true)),
             "false" | "no" | "0" => Ok(json!(false)),
@@ -317,6 +317,15 @@ mod tests {
     }
     fn help(spec: &ToolSpec) -> String {
         super::help(spec, &(spec.input_schema)())
+    }
+
+    #[test]
+    fn number_rejects_non_finite() {
+        for raw in ["NaN", "inf", "-inf", "infinity"] {
+            let e = convert("number", "x", raw).expect_err(raw);
+            assert!(e.contains("expects a number"), "{e}");
+        }
+        assert_eq!(convert("number", "x", "1.5"), Ok(json!(1.5)));
     }
 
     #[test]

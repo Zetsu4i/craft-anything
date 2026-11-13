@@ -80,7 +80,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "app_builds_line_up",
             "Match functions between two builds",
-            "Pair the functions of two builds of a program (two absolute paths) with the built-in engine. In order: unique names that aren't generated; identical bytes; bytes with addresses masked out; a structural fingerprint of block count, called names and referenced strings. Each pair says how it was matched, with what confidence, and what comparing the bodies found: a pair by name is still reported as changed when its code differs. Candidates that can't be told apart stay unpaired and are listed as ambiguous. Lists are paged together (offset/limit); show picks one; detail=summary keeps every row for core_evidence_browse. Nothing is executed. Takes as long as analysing both programs.",
+            "Pair the functions of two builds of a program (two absolute paths) with the built-in engine. In order: unique names that aren't generated; Rust names with the compiler's hashes left out (a crate's hash changes with the toolchain); identical bytes; bytes with addresses masked out; a structural fingerprint of block count, called names and referenced strings. Each pair says how it was matched, with what confidence, and what comparing the bodies found: a pair by name is still reported as changed when its code differs. Candidates that can't be told apart stay unpaired and are listed as ambiguous. Lists are paged together (offset/limit); show picks one; detail=summary keeps every row for core_evidence_browse. Nothing is executed. Takes as long as analysing both programs.",
             "Line up the functions of an old and a new version of a program, to see what changed.",
             Toolset::Native,
             e,
@@ -746,7 +746,7 @@ fn is_changed(p: &MatchedPair) -> bool {
 
 fn method_counts(r: &MatchResult) -> Value {
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for m in [MatchMethod::ExactName, MatchMethod::IdenticalBytes, MatchMethod::MaskedBytes, MatchMethod::Structure] {
+    for m in [MatchMethod::ExactName, MatchMethod::NameWithoutHash, MatchMethod::IdenticalBytes, MatchMethod::MaskedBytes, MatchMethod::Structure] {
         counts.insert(m.name(), r.pairs.iter().filter(|p| p.method == m).count());
     }
     json!(counts)
@@ -1380,6 +1380,48 @@ mod tests {
 
     fn pair<'a>(v: &'a Value, left_name: &str) -> &'a Value {
         v["result"]["pairs"].as_array().unwrap().iter().find(|p| p["left"]["name"] == left_name).unwrap_or_else(|| panic!("no pair for {left_name}: {v}"))
+    }
+
+    #[test]
+    fn rust_names_pair_across_toolchains_without_their_crate_hash() {
+        // Two toolchains give every crate a new hash (`Cs<hash>_`), so no exact name matches; a
+        // live line-up of two `cargo` builds paired 1,448 of ~36,000 functions.
+        let build = |hash: &str, edited: u32, dupes: &[(&str, u32)]| {
+            let name = |path: &str| format!("_RNvNtCs{hash}_5alloc3vec{path}");
+            let mut funcs =
+                vec![(name("9from_elem"), pf::plain_body(1)), (name("6caller"), pf::calling_body(0x20, 0, 11)), (name("6edited"), pf::plain_body(edited))];
+            for (h, v) in dupes {
+                funcs.push((format!("_RNvCs{h}_4dupe3fun"), pf::plain_body(*v)));
+            }
+            let funcs: Vec<(&str, Vec<u8>)> = funcs.iter().map(|(n, b)| (n.as_str(), b.clone())).collect();
+            pf::elf_with_functions(&funcs)
+        };
+        let l = build("3XW7gbOxCtj", 2, &[("aaaa", 40)]);
+        let r = build("k1nqp0aJv2u", 200, &[("bbbb", 41), ("cccc", 42)]);
+        let (lp, rp) = (temp_file("old.elf", &l), temp_file("new.elf", &r));
+        let v = call(&engine(), "app_builds_line_up", json!({"left": lp, "right": rp}));
+
+        let kept = pair(&v, "_RNvNtCs3XW7gbOxCtj_5alloc3vec9from_elem");
+        assert_eq!(
+            (&kept["method"], &kept["body"], &kept["confidence"], &kept["renamed"]),
+            (&json!("name_without_hash"), &json!("identical"), &json!("high"), &json!(false))
+        );
+        // A call to the same path under another hash is the same call.
+        let caller = pair(&v, "_RNvNtCs3XW7gbOxCtj_5alloc3vec6caller");
+        assert_eq!((&caller["method"], &caller["body"]), (&json!("name_without_hash"), &json!("identical")));
+        assert!(caller.get("differences").is_none(), "{caller}");
+        let edited = pair(&v, "_RNvNtCs3XW7gbOxCtj_5alloc3vec6edited");
+        assert_eq!((&edited["method"], &edited["body"]), (&json!("name_without_hash"), &json!("changed")));
+
+        // Two versions of one crate in a build share the name: neither is guessed.
+        let groups = v["result"]["ambiguous"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(
+            (groups[0]["method"].as_str(), groups[0]["left"].as_array().map(Vec::len), groups[0]["right"].as_array().map(Vec::len)),
+            (Some("name_without_hash"), Some(1), Some(2))
+        );
+        let counts = &v["result"]["counts"];
+        assert_eq!((&counts["by_method"]["name_without_hash"], &counts["by_method"]["exact_name"], &counts["renamed"]), (&json!(3), &json!(0), &json!(0)));
     }
 
     #[test]

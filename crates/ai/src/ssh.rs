@@ -260,7 +260,7 @@ pub fn open_tunnel(ssh_host: &str, remote_host: &str, remote_port: u16) -> Resul
         }
         if let Some(r) = proc.try_result() {
             let msg = match r {
-                Ok(out) => out.stderr_text().trim().to_string(),
+                Ok(out) => out.stderr_end_text().trim().to_string(),
                 Err(e) => e.message.clone(),
             };
             return Err(ToolError::new(ErrorCode::EngineMissing, format!("ssh to {ssh_host} failed: {msg}"))

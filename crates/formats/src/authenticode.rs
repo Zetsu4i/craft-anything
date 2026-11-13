@@ -261,6 +261,9 @@ fn read_signature(data: &[u8], h: &PeHeaders, payload: &[u8], table_ok: bool) ->
     let certificates: Vec<CertInfo> = sd.certificates.iter().filter_map(|c| der::certificate(c)).collect();
     let signer = sd.signer_cert().and_then(der::certificate);
     let mut notes = Vec::new();
+    if sd.non_minimal_length {
+        notes.push(der::NON_MINIMAL_LENGTH_NOTE.into());
+    }
     if signer_count > 1 {
         notes.push(format!("The block has {signer_count} signers; only the first was read."));
     }
@@ -310,7 +313,11 @@ fn read_signature(data: &[u8], h: &PeHeaders, payload: &[u8], table_ok: bool) ->
     {
         report.signature_check = check.signature_valid;
         report.chain = Some(check.chain);
-        report.notes.extend(check.notes);
+        for note in check.notes {
+            if !report.notes.contains(&note) {
+                report.notes.push(note);
+            }
+        }
     }
     report
 }

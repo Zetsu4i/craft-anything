@@ -72,16 +72,120 @@ fn read_capped(mut src: impl Read, cap: usize) -> Result<Vec<u8>, DecompressErro
     }
 }
 
-/// Decompress an xz stream, producing at most `max_out` bytes.
+/// Decompress every xz stream, including standard stream padding, within one output budget.
 pub fn xz(input: &[u8], max_out: u64) -> Result<Vec<u8>, DecompressError> {
+    let ranges = xz_stream_ranges(input, max_out)?;
+    let mut out = CapWrite::new(cap_of(max_out));
+    for range in ranges.into_iter().rev() {
+        let stream = input.get(range).ok_or(DecompressError::Truncated)?;
+        let mut cursor = io::Cursor::new(stream);
+        match lzma_rs::xz_decompress(&mut cursor, &mut out) {
+            Ok(()) => {}
+            Err(_) if out.exceeded => return Err(DecompressError::TooLarge),
+            Err(lzma_rs::error::Error::HeaderTooShort(_)) => return Err(DecompressError::Truncated),
+            Err(_) => return Err(DecompressError::Corrupt),
+        }
+    }
+    Ok(out.buf)
+}
+
+/// Decode only the first stream in a SquashFS block; bytes after its footer are not another block.
+pub(crate) fn xz_single(input: &[u8], max_out: u64) -> Result<Vec<u8>, DecompressError> {
     let mut out = CapWrite::new(cap_of(max_out));
     let mut cursor = io::Cursor::new(input);
     match lzma_rs::xz_decompress(&mut cursor, &mut out) {
         Ok(()) => Ok(out.buf),
         Err(_) if out.exceeded => Err(DecompressError::TooLarge),
         Err(lzma_rs::error::Error::HeaderTooShort(_)) => Err(DecompressError::Truncated),
-        Err(_) => Err(DecompressError::Corrupt),
+        Err(_) => {
+            // The decoder requires EOF after the first footer. Recheck its consumed prefix as
+            // a complete stream, rather than accepting partial output from a failed decode.
+            let end = usize::try_from(cursor.position()).map_err(|_| DecompressError::Corrupt)?;
+            if end == 0 || end >= input.len() {
+                return Err(DecompressError::Corrupt);
+            }
+            let prefix = input.get(..end).ok_or(DecompressError::Truncated)?;
+            drop(out);
+            xz(prefix, max_out)
+        }
     }
+}
+
+/// Find stream boundaries backwards through their checked footer/index sizes, without
+/// repeatedly trying the decoder at candidate magic bytes inside compressed data.
+fn xz_stream_ranges(input: &[u8], max_out: u64) -> Result<Vec<std::ops::Range<usize>>, DecompressError> {
+    let mut ranges = Vec::new();
+    let mut end = input.len();
+    let mut declared = 0u64;
+    while end > 0 {
+        let padded_end = end;
+        while end > 0 && input.get(end - 1) == Some(&0) {
+            end -= 1;
+        }
+        if end == 0 || !(padded_end - end).is_multiple_of(4) {
+            return Err(DecompressError::Corrupt);
+        }
+        let footer_at = end.checked_sub(12).ok_or(DecompressError::Truncated)?;
+        let footer = input.get(footer_at..end).ok_or(DecompressError::Truncated)?;
+        let read = crate::bytes::Reader::new(footer);
+        let footer_fields = footer.get(4..10).ok_or(DecompressError::Truncated)?;
+        if footer.get(10..) != Some(b"YZ") || read.u32_le(0) != Some(crate::firmware::crc32(footer_fields)) {
+            return Err(DecompressError::Corrupt);
+        }
+        let backward = u64::from(read.u32_le(4).ok_or(DecompressError::Truncated)?);
+        let index_len = usize::try_from((backward + 1) * 4).map_err(|_| DecompressError::Corrupt)?;
+        let index_at = footer_at.checked_sub(index_len).ok_or(DecompressError::Truncated)?;
+        let index = input.get(index_at..footer_at).ok_or(DecompressError::Truncated)?;
+        let crc_at = index.len().checked_sub(4).ok_or(DecompressError::Truncated)?;
+        let index_read = crate::bytes::Reader::new(index);
+        let index_fields = index.get(..crc_at).ok_or(DecompressError::Truncated)?;
+        if index.first() != Some(&0) || index_read.u32_le(crc_at) != Some(crate::firmware::crc32(index_fields)) {
+            return Err(DecompressError::Corrupt);
+        }
+        let mut records = index.get(1..crc_at).ok_or(DecompressError::Corrupt)?;
+        let count = xz_vli(&mut records)?;
+        if count > (records.len() / 2) as u64 {
+            return Err(DecompressError::Corrupt);
+        }
+        let mut block_bytes = 0usize;
+        for _ in 0..count {
+            let unpadded = xz_vli(&mut records)?;
+            if unpadded == 0 {
+                return Err(DecompressError::Corrupt);
+            }
+            let padded = usize::try_from(unpadded.checked_add(3).ok_or(DecompressError::Corrupt)? & !3).map_err(|_| DecompressError::Corrupt)?;
+            block_bytes = block_bytes.checked_add(padded).filter(|bytes| *bytes <= index_at).ok_or(DecompressError::Corrupt)?;
+            declared = declared.checked_add(xz_vli(&mut records)?).filter(|size| *size <= max_out).ok_or(DecompressError::TooLarge)?;
+        }
+        if records.len() > 3 || records.iter().any(|&byte| byte != 0) {
+            return Err(DecompressError::Corrupt);
+        }
+        let start = index_at.checked_sub(block_bytes).and_then(|at| at.checked_sub(12)).ok_or(DecompressError::Corrupt)?;
+        let magic_end = start.checked_add(6).ok_or(DecompressError::Corrupt)?;
+        if input.get(start..magic_end) != Some(b"\xfd7zXZ\0") {
+            return Err(DecompressError::Corrupt);
+        }
+        ranges.push(start..end);
+        end = start;
+    }
+    if ranges.is_empty() {
+        return Err(DecompressError::Corrupt);
+    }
+    Ok(ranges)
+}
+
+/// XZ variable-length integers have at most nine bytes and no redundant final zero.
+fn xz_vli(input: &mut &[u8]) -> Result<u64, DecompressError> {
+    let mut value = 0u64;
+    for shift in (0..63).step_by(7) {
+        let (&byte, rest) = input.split_first().ok_or(DecompressError::Truncated)?;
+        *input = rest;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return if shift != 0 && byte == 0 { Err(DecompressError::Corrupt) } else { Ok(value) };
+        }
+    }
+    Err(DecompressError::Corrupt)
 }
 
 /// Decompress a standalone LZMA (`.lzma`, `0x5d` props) stream, producing at most `max_out` bytes.
@@ -204,6 +308,15 @@ pub fn zstd(mut input: &[u8], max_out: u64) -> Result<Vec<u8>, DecompressError> 
 /// Decompress one raw LZ4 block (no frame) that inflates to exactly `out_len` bytes, as Unity
 /// bundles store them.
 pub fn lz4_block(input: &[u8], out_len: usize) -> Result<Vec<u8>, DecompressError> {
+    let out = lz4_block_capped(input, out_len)?;
+    if out.len() != out_len {
+        return Err(DecompressError::Truncated);
+    }
+    Ok(out)
+}
+
+/// Decode one raw LZ4 block when its output size is an upper bound, as in SquashFS metadata.
+pub(crate) fn lz4_block_capped(input: &[u8], out_len: usize) -> Result<Vec<u8>, DecompressError> {
     let mut out = Vec::with_capacity(out_len.min(64 << 20));
     let mut i = 0usize;
     let byte = |i: &mut usize| -> Result<u8, DecompressError> {
@@ -257,9 +370,6 @@ pub fn lz4_block(input: &[u8], out_len: usize) -> Result<Vec<u8>, DecompressErro
             remaining -= count;
         }
     }
-    if out.len() != out_len {
-        return Err(DecompressError::Truncated);
-    }
     Ok(out)
 }
 
@@ -311,6 +421,81 @@ mod tests {
         for len in 0..c.len() {
             let _ = xz(&c[..len], 1 << 20);
         }
+    }
+
+    #[test]
+    fn xz_concatenated_streams_and_padding_share_one_budget() {
+        let input = [fx::XZ_FIXTURE, &[0; 4], fx::XZ_FIXTURE, &[0; 8]].concat();
+        let expected = [fx::XZ_PLAIN, fx::XZ_PLAIN].concat();
+        assert_eq!(xz(&input, expected.len() as u64).unwrap(), expected);
+        assert_eq!(xz(&input, expected.len() as u64 - 1), Err(DecompressError::TooLarge));
+        let mut empty = Vec::new();
+        lzma_rs::xz_compress(&mut io::Cursor::new(b""), &mut empty).unwrap();
+        let with_empty = [&empty[..], fx::XZ_FIXTURE, &empty[..]].concat();
+        assert_eq!(xz(&with_empty, fx::XZ_PLAIN.len() as u64).unwrap(), fx::XZ_PLAIN);
+        assert!(xz(&empty, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn xz_first_stream_ignores_the_tail_and_keeps_its_own_budget() {
+        let cap = fx::XZ_PLAIN.len() as u64;
+        assert_eq!(xz_single(fx::XZ_FIXTURE, cap).unwrap(), fx::XZ_PLAIN);
+        for tail in [fx::XZ_FIXTURE, &fx::XZ_FIXTURE[..13], b"junk", &[0; 4]] {
+            let input = [fx::XZ_FIXTURE, tail].concat();
+            assert_eq!(xz_single(&input, cap).unwrap(), fx::XZ_PLAIN);
+            assert_eq!(xz_single(&input, cap - 1), Err(DecompressError::TooLarge));
+        }
+        let mut empty = Vec::new();
+        lzma_rs::xz_compress(&mut io::Cursor::new(b""), &mut empty).unwrap();
+        let input = [&empty[..], fx::XZ_FIXTURE].concat();
+        assert!(xz_single(&input, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn xz_first_stream_never_returns_failed_decode_output() {
+        for len in 0..fx::XZ_FIXTURE.len() {
+            assert!(xz_single(&fx::XZ_FIXTURE[..len], 1024).is_err(), "truncated at {len}");
+        }
+        for at in [0, 8, fx::XZ_FIXTURE.len() - 13, fx::XZ_FIXTURE.len() - 12, fx::XZ_FIXTURE.len() - 1] {
+            let mut input = fx::XZ_FIXTURE.to_vec();
+            input[at] ^= 1;
+            input.extend_from_slice(fx::XZ_FIXTURE);
+            assert!(xz_single(&input, 1024).is_err(), "damaged at {at}");
+        }
+    }
+
+    #[test]
+    fn xz_rejects_incomplete_members_and_nonstandard_padding() {
+        for padding in [1, 2, 3, 5] {
+            let input = [fx::XZ_FIXTURE, &vec![0; padding]].concat();
+            assert!(xz(&input, 1000).is_err());
+        }
+        assert!(xz(&[&[0; 4][..], fx::XZ_FIXTURE].concat(), 1000).is_err());
+        assert!(xz(&[fx::XZ_FIXTURE, b"junk"].concat(), 1000).is_err());
+        for missing in 1..fx::XZ_FIXTURE.len() {
+            let input = [fx::XZ_FIXTURE, &fx::XZ_FIXTURE[..fx::XZ_FIXTURE.len() - missing]].concat();
+            assert!(xz(&input, 1000).is_err(), "missing {missing} bytes");
+        }
+        for at in [fx::XZ_FIXTURE.len() - 13, fx::XZ_FIXTURE.len() - 12] {
+            let mut damaged = fx::XZ_FIXTURE.to_vec();
+            damaged[at] ^= 1;
+            assert!(xz(&damaged, 1000).is_err());
+        }
+    }
+
+    #[test]
+    fn xz_index_sizes_and_integer_encodings_are_checked() {
+        assert_eq!(xz_vli(&mut &[0x80, 0][..]), Err(DecompressError::Corrupt));
+        assert_eq!(xz_vli(&mut &[0xff; 10][..]), Err(DecompressError::Corrupt));
+        assert_eq!(xz_vli(&mut &[0x81, 1][..]), Ok(129));
+        let mut damaged = fx::XZ_FIXTURE.to_vec();
+        let footer = damaged.len() - 12;
+        let backward = u32::from_le_bytes(damaged[footer + 4..footer + 8].try_into().unwrap());
+        let index = footer - (backward as usize + 1) * 4;
+        damaged[index + 2] = 0;
+        let checksum = crate::firmware::crc32(&damaged[index..footer - 4]);
+        damaged[footer - 4..footer].copy_from_slice(&checksum.to_le_bytes());
+        assert!(xz(&damaged, 1000).is_err());
     }
 
     #[test]

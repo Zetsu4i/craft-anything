@@ -1,13 +1,15 @@
 //! Pair the functions of two builds of a program, from what the built-in engine found in each.
 //!
 //! Each stage only looks at what earlier stages left: unique exact names that aren't generated,
-//! then identical bytes, then bytes with addresses masked out, then a structural fingerprint. A
+//! then Rust names with the compiler's hashes left out (a crate's hash changes with the
+//! toolchain, so the same function rarely keeps its exact name across one), then identical bytes, then bytes with addresses masked out, then a structural fingerprint. A
 //! pair needs one candidate on each side; anything else stays unmatched and is listed as
 //! ambiguous. Equal names say two functions correspond, not that the code is the same, so every
 //! pair says what comparing the bodies found.
 
 use craft_anything_disasm::{ArmConsts, Control, DisasmError, Flow, Function, Image, Mode, Op, Program, XrefKind};
 use craft_anything_evidence::sha256_hex;
+use craft_anything_formats::binary::rust_name_without_hash;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,6 +23,8 @@ const STRONG_BODY_BYTES: u64 = 64;
 #[serde(rename_all = "snake_case")]
 pub enum MatchMethod {
     ExactName,
+    /// A Rust name equal once the compiler's hashes are left out.
+    NameWithoutHash,
     IdenticalBytes,
     MaskedBytes,
     Structure,
@@ -30,6 +34,7 @@ impl MatchMethod {
     pub fn name(self) -> &'static str {
         match self {
             MatchMethod::ExactName => "exact_name",
+            MatchMethod::NameWithoutHash => "name_without_hash",
             MatchMethod::IdenticalBytes => "identical_bytes",
             MatchMethod::MaskedBytes => "masked_bytes",
             MatchMethod::Structure => "structure",
@@ -104,6 +109,8 @@ pub struct MatchResult {
 struct Print {
     entry: u64,
     name: String,
+    /// A Rust name demangled without its hashes; `None` for other names.
+    plain: Option<String>,
     generated: bool,
     size: u64,
     /// Every byte of every block was read.
@@ -112,7 +119,8 @@ struct Print {
     /// `None` where this processor's address fields aren't masked.
     masked: Option<String>,
     blocks: usize,
-    /// Called names in order, `None` for a call to something unnamed.
+    /// Called names in order (Rust names without their hashes), `None` for a call to something
+    /// unnamed.
     calls: Vec<Option<String>>,
     strings: Vec<String>,
 }
@@ -120,6 +128,11 @@ struct Print {
 impl Print {
     fn as_ref(&self) -> FunctionRef {
         FunctionRef { entry: self.entry, name: self.name.clone(), size: self.size }
+    }
+
+    /// The name two builds are compared by: a Rust name without its hashes, else the name.
+    fn compared_name(&self) -> &str {
+        self.plain.as_deref().unwrap_or(&self.name)
     }
 
     /// The structure stage's key; `None` when there's nothing distinctive in it.
@@ -219,7 +232,22 @@ fn mask_a64(insn: &craft_anything_disasm::Insn, f: &Function, word: u32) -> u32 
     word
 }
 
-fn print_function(img: &Image, prog: &Program, f: &Function) -> Print {
+/// Demangled Rust names, worked out once per name: the same callee is called from many places.
+#[derive(Default)]
+struct Plain(BTreeMap<String, Option<String>>);
+
+impl Plain {
+    fn of(&mut self, name: &str) -> Option<String> {
+        if let Some(p) = self.0.get(name) {
+            return p.clone();
+        }
+        let p = rust_name_without_hash(name);
+        self.0.insert(name.to_string(), p.clone());
+        p
+    }
+}
+
+fn print_function(img: &Image, prog: &Program, f: &Function, plain: &mut Plain) -> Print {
     let mut blocks: Vec<_> = f.blocks.iter().collect();
     blocks.sort_by_key(|b| b.start);
     let can_mask = matches!(prog.mode, Mode::X32 | Mode::X64 | Mode::A64);
@@ -277,7 +305,7 @@ fn print_function(img: &Image, prog: &Program, f: &Function) -> Print {
         .into_iter()
         .map(|c| {
             let generated = c.target.and_then(|t| prog.functions.get(&t)).is_some_and(|t| t.name_source == "generated");
-            if generated { None } else { c.name }
+            if generated { None } else { c.name.map(|n| plain.of(&n).unwrap_or(n)) }
         })
         .collect();
     let mut strings = BTreeSet::new();
@@ -293,6 +321,7 @@ fn print_function(img: &Image, prog: &Program, f: &Function) -> Print {
     Print {
         entry: f.entry,
         name: f.name.clone(),
+        plain: plain.of(&f.name),
         generated: f.name_source == "generated",
         size: raw.len() as u64,
         whole,
@@ -307,6 +336,7 @@ fn print_function(img: &Image, prog: &Program, f: &Function) -> Print {
 fn prints(img: &Image, prog: &Program, ctl: &dyn Control, what: &str) -> Result<Vec<Print>, DisasmError> {
     let total = prog.functions.len().max(1) as f32;
     let mut out = Vec::with_capacity(prog.functions.len());
+    let mut plain = Plain::default();
     for (i, f) in prog.functions.values().enumerate() {
         if ctl.cancelled() {
             return Err(DisasmError::Cancelled);
@@ -314,7 +344,7 @@ fn prints(img: &Image, prog: &Program, ctl: &dyn Control, what: &str) -> Result<
         if i % 1024 == 0 {
             ctl.progress(i as f32 / total, &format!("reading the bodies of {what}"));
         }
-        out.push(print_function(img, prog, f));
+        out.push(print_function(img, prog, f, &mut plain));
     }
     Ok(out)
 }
@@ -394,7 +424,7 @@ impl Matcher<'_> {
         }
         let (body, differences) = compare(l, r, self.same_processor);
         let confidence = match method {
-            MatchMethod::ExactName => MatchConfidence::High,
+            MatchMethod::ExactName | MatchMethod::NameWithoutHash => MatchConfidence::High,
             MatchMethod::IdenticalBytes if l.size >= STRONG_BODY_BYTES => MatchConfidence::High,
             MatchMethod::IdenticalBytes | MatchMethod::MaskedBytes => MatchConfidence::Medium,
             MatchMethod::Structure => MatchConfidence::Low,
@@ -405,7 +435,7 @@ impl Matcher<'_> {
             method,
             confidence,
             body,
-            renamed: !l.generated && !r.generated && l.name != r.name,
+            renamed: !l.generated && !r.generated && l.compared_name() != r.compared_name(),
             differences,
         });
     }
@@ -460,6 +490,7 @@ pub fn match_programs(left: (&Image, &Program), right: (&Image, &Program), ctl: 
         noted: Vec::new(),
     };
     m.stage(MatchMethod::ExactName, |p| (!p.generated).then(|| p.name.clone()));
+    m.stage(MatchMethod::NameWithoutHash, |p| if p.generated { None } else { p.plain.clone() });
     if ctl.cancelled() {
         return Err(DisasmError::Cancelled);
     }

@@ -19,6 +19,7 @@ craft-anything-platform = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
+regex = { workspace = true }
 toml = { workspace = true }
 ureq = "3"
 dirs = "6"

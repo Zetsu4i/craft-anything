@@ -84,8 +84,9 @@ pub struct BackendOptions {
     /// Most model turns per user message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
-    /// Input tokens before trimming and summarising the conversation. Omitted or zero uses the
-    /// local/cloud default; this does not change the model server's own context window.
+    /// Input tokens before trimming and summarising the conversation. Omitted or zero uses three
+    /// quarters of the window the server says it has (`crate::window`), else the local/cloud default;
+    /// this does not change the model server's own context window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u64>,
     /// API backends: the most requests to send in a minute, for a service that limits them (120

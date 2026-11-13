@@ -5,7 +5,7 @@
 use crate::FormatError;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Most metadata entries kept.
 const MAX_METADATA: usize = 65_536;
@@ -234,9 +234,6 @@ impl<'a> Cursor<'a> {
     fn raw_str(&mut self) -> Option<&'a [u8]> {
         let n = usize::try_from(self.u64()?).ok()?;
         self.take(n)
-    }
-    fn string(&mut self) -> Option<String> {
-        self.raw_str().map(|b| String::from_utf8_lossy(b).into_owned())
     }
     /// Skip a bounded string without building it, keeping only its first characters.
     fn short_string(&mut self) -> Option<(String, bool)> {
@@ -468,21 +465,29 @@ fn parse_gguf(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError>
     r.declared_tensors = tensor_count;
     r.declared_metadata = kv_count;
 
+    // Borrow complete identities: display truncation and retained-entry caps must not
+    // change which binary records are considered duplicates.
+    let mut metadata_keys = BTreeSet::new();
+    let mut tensor_names = BTreeSet::new();
     let mut alignment = 32u64;
     let mut file_type = None;
     let mut ended_early = false;
     let mut i = 0u64;
     while i < kv_count {
         let parsed = (|| {
-            let key = c.string()?;
+            let identity = c.raw_str()?;
+            let key = String::from_utf8_lossy(identity).into_owned();
             let t = c.u32()?;
             let (value, value_type, count, shortened) = gguf_value(&mut c, t, 0)?;
-            Some(ModelMetadata { key, value_type, value, count, shortened })
+            Some((identity, ModelMetadata { key, value_type, value, count, shortened }))
         })();
-        let Some(entry) = parsed else {
+        let Some((identity, entry)) = parsed else {
             ended_early = true;
             break;
         };
+        if !metadata_keys.insert(identity) {
+            return Err(FormatError::Malformed(format!("GGUF duplicate metadata key at index {i}")));
+        }
         r.metadata_read = r.metadata_read.saturating_add(1);
         match entry.key.as_str() {
             "general.architecture" => r.architecture = entry.value.as_str().map(str::to_string),
@@ -505,7 +510,8 @@ fn parse_gguf(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError>
         let mut i = 0u64;
         while i < tensor_count {
             let parsed = (|| {
-                let name = c.string()?;
+                let identity = c.raw_str()?;
+                let name = String::from_utf8_lossy(identity).into_owned();
                 let dims = c.u32()?;
                 if dims > MAX_DIMS {
                     return None;
@@ -516,12 +522,15 @@ fn parse_gguf(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError>
                 }
                 let ty = c.u32()?;
                 let offset = c.u64()?;
-                Some((name, shape, ty, offset))
+                Some((identity, name, shape, ty, offset))
             })();
-            let Some((name, shape, ty, data_offset)) = parsed else {
+            let Some((identity, name, shape, ty, data_offset)) = parsed else {
                 ended_early = true;
                 break;
             };
+            if !tensor_names.insert(identity) {
+                return Err(FormatError::Malformed(format!("GGUF duplicate tensor name at index {i}")));
+            }
             let (parameters, overflow) = element_count(&shape);
             if overflow {
                 r.warn(format!("{name}: its shape multiplies past what a number can hold"));
@@ -591,6 +600,76 @@ fn safetensors_element_bits(dtype: &str) -> Option<u64> {
     }
 }
 
+/// JSON values whose object keys cannot overwrite an earlier value while being read.
+/// Safetensors forbids duplicate keys, including in tensor descriptions and metadata.
+struct UniqueJson(Value);
+
+impl<'de> serde::Deserialize<'de> for UniqueJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueJson;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("JSON with distinct keys in each object")
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Null))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Bool(value)))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Number(value.into())))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::Number(value.into())))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(|number| UniqueJson(Value::Number(number)))
+                    .ok_or_else(|| E::custom("a non-finite number in a model header"))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::String(value.to_owned())))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(UniqueJson(Value::String(value)))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(UniqueJson(value)) = sequence.next_element()? {
+                    values.push(value);
+                }
+                Ok(UniqueJson(Value::Array(values)))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut object: A) -> Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = object.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom("a duplicate key in the safetensors header"));
+                    }
+                    let UniqueJson(value) = object.next_value()?;
+                    values.insert(key, value);
+                }
+                Ok(UniqueJson(Value::Object(values)))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 fn parse_safetensors(prefix: &[u8], file_size: u64) -> Result<ModelReport, FormatError> {
     let declared = safetensors_header_len(prefix).ok_or_else(|| FormatError::Malformed("not a safetensors header".into()))?;
     if declared > 100_000_000 {
@@ -604,7 +683,7 @@ fn parse_safetensors(prefix: &[u8], file_size: u64) -> Result<ModelReport, Forma
         return Err(FormatError::TooLarge(format!("the header is {declared} bytes and only {} were read", prefix.len())));
     }
     let body = usize::try_from(end).ok().and_then(|e| prefix.get(8..e)).ok_or_else(|| FormatError::Truncated("safetensors header".into()))?;
-    let json: Value = serde_json::from_slice(body).map_err(|e| FormatError::Malformed(format!("the header isn't JSON: {e}")))?;
+    let UniqueJson(json) = serde_json::from_slice(body).map_err(|e| FormatError::Malformed(format!("the header isn't JSON: {e}")))?;
     let obj = json.as_object().ok_or_else(|| FormatError::Malformed("the header isn't a JSON object".into()))?;
 
     let mut r = ModelReport::new(ModelFormat::Safetensors, file_size);

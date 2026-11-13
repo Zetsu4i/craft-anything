@@ -35,14 +35,17 @@ struct Layout {
     label: &'static str,
     /// A byte after the flags saying how exec arguments extend.
     extension_byte: bool,
+    /// The main script's module format follows the execution-argument extension.
+    module_byte: bool,
     /// The main script's path comes before its code.
     code_path: bool,
 }
 
 const LAYOUTS: &[Layout] = &[
-    Layout { label: "with_exec_argv_extension", extension_byte: true, code_path: true },
-    Layout { label: "with_code_path", extension_byte: false, code_path: true },
-    Layout { label: "code_only", extension_byte: false, code_path: false },
+    Layout { label: "with_module_format", extension_byte: true, module_byte: true, code_path: true },
+    Layout { label: "with_exec_argv_extension", extension_byte: true, module_byte: false, code_path: true },
+    Layout { label: "with_code_path", extension_byte: false, module_byte: false, code_path: true },
+    Layout { label: "code_only", extension_byte: false, module_byte: false, code_path: false },
 ];
 
 /// A range of the blob, relative to the file.
@@ -113,6 +116,7 @@ struct Parsed {
     layout: Layout,
     flags: u32,
     extension: Option<u8>,
+    module_format: Option<&'static str>,
     code_path: Option<Part>,
     code: Part,
     code_cache: Option<Part>,
@@ -137,6 +141,17 @@ fn parse_with(blob: &[u8], base: usize, flags: u32, layout: Layout) -> Option<Pa
         extension = Some(e);
         c.pos += 1;
     }
+    let module_format = if layout.module_byte {
+        let format = match blob.get(c.pos)? {
+            0 => "commonjs",
+            1 => "module",
+            _ => return None,
+        };
+        c.pos += 1;
+        Some(format)
+    } else {
+        None
+    };
     let mut remaining = MAX_TEXT_BYTES;
     let mut metadata_truncated = false;
     let code_path = if layout.code_path {
@@ -182,6 +197,7 @@ fn parse_with(blob: &[u8], base: usize, flags: u32, layout: Layout) -> Option<Pa
         layout,
         flags,
         extension,
+        module_format,
         code_path,
         code,
         code_cache,
@@ -310,6 +326,7 @@ impl PackedFormat for NodeSea {
             "uses_snapshot": snapshot,
             "uses_code_cache": p.code_cache.is_some(),
             "exec_argv_extension": p.extension,
+            "module_format": p.module_format,
             "code_path": code_path,
             "assets": p.asset_count,
             "assets_listed": p.assets.len().min(room),

@@ -694,14 +694,9 @@ impl<'a> Scanner<'a> {
         while p < limit {
             let Some(rel) = self.data.get(p..limit).and_then(|s| s.windows(4).position(|w| w == b"PK\x05\x06")) else { break };
             let at = p + rel;
-            if let Some(cl) = self.r.u16_le(at + 20)
-                && let (Some(cd_size), Some(cd_off)) = (self.r.u32_le(at + 12), self.r.u32_le(at + 16))
-                && (cd_off as usize).checked_add(cd_size as usize).is_some_and(|e| i.checked_add(e).is_some_and(|x| x <= at))
-            {
-                end = at.checked_add(22 + usize::from(cl)).filter(|e| *e <= limit);
-                if end.is_some() {
-                    break;
-                }
+            if let Some(candidate) = self.zip_end(i, at) {
+                end = Some(candidate);
+                break;
             }
             p = at + 1;
         }
@@ -722,6 +717,43 @@ impl<'a> Scanner<'a> {
             }
         };
         Some(reg(i, Some(length), "zip", Family::Archive, format!("ZIP archive, first entry {name:?}"), conf, Unpack::Members, details))
+    }
+
+    /// Match an end record to this local-header start, not to a ZIP stored inside a member.
+    /// Candidate checks use only fixed headers; the chosen directory is parsed once above.
+    fn zip_end(&self, start: usize, at: usize) -> Option<usize> {
+        let end_record = Reader::new(self.r.slice(at, 22)?);
+        let end = at.checked_add(22 + usize::from(end_record.u16_le(20)?)).filter(|&end| end <= self.data.len())?;
+        let mut size = u64::from(end_record.u32_le(12)?);
+        let mut offset = u64::from(end_record.u32_le(16)?);
+        let mut directory_end = at;
+        let classic_end = offset.checked_add(size).and_then(|end| usize::try_from(end).ok()).and_then(|end| start.checked_add(end));
+        if classic_end != Some(at) {
+            let locator_at = at.checked_sub(20)?;
+            let locator = Reader::new(self.r.slice(locator_at, 20)?);
+            if locator.slice(0, 4) != Some(b"PK\x06\x07") {
+                return None;
+            }
+            let record_at = start.checked_add(usize::try_from(locator.u64_le(8)?).ok()?)?;
+            let record = Reader::new(self.r.slice(record_at, 56)?);
+            let record_size = usize::try_from(record.u64_le(4)?).ok()?;
+            if record.slice(0, 4) != Some(b"PK\x06\x06") || record_size < 44 || record_at.checked_add(12)?.checked_add(record_size)? != locator_at {
+                return None;
+            }
+            let zip64_size = record.u64_le(40)?;
+            let zip64_offset = record.u64_le(48)?;
+            if (size != u64::from(u32::MAX) && size != zip64_size) || (offset != u64::from(u32::MAX) && offset != zip64_offset) {
+                return None;
+            }
+            size = zip64_size;
+            offset = zip64_offset;
+            directory_end = record_at;
+        }
+        let directory_start = start.checked_add(usize::try_from(offset).ok()?)?;
+        if size < 46 || directory_start.checked_add(usize::try_from(size).ok()?)? != directory_end || self.r.slice(directory_start, 4) != Some(b"PK\x01\x02") {
+            return None;
+        }
+        Some(end)
     }
 
     fn sevenz(&mut self, i: usize) -> Option<Region> {

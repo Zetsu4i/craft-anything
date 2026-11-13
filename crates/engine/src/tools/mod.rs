@@ -224,10 +224,14 @@ pub fn evidence_for_active(session: &Session, operation: &str) -> Result<Evidenc
 /// Parse an address given as `0x…` hex, plain hex with a leading letter, or decimal.
 pub fn parse_address(s: &str) -> Result<u64, ToolError> {
     let t = s.trim();
+    // `from_str_radix` accepts a leading sign, so require pure hex digits first.
+    let hex = |d: &str| {
+        if !d.is_empty() && d.chars().all(|c| c.is_ascii_hexdigit()) { u64::from_str_radix(d, 16).ok() } else { None }
+    };
     let parsed = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        u64::from_str_radix(h, 16).ok()
+        hex(h)
     } else if t.chars().any(|c| c.is_ascii_alphabetic()) {
-        u64::from_str_radix(t.trim_end_matches(['h', 'H']), 16).ok()
+        hex(t.trim_end_matches(['h', 'H']))
     } else {
         t.parse::<u64>().ok()
     };
@@ -245,5 +249,8 @@ mod tests {
         assert_eq!(parse_address("4096").unwrap(), 4096);
         assert!(parse_address("0xZZ").is_err());
         assert!(parse_address("").is_err());
+        assert!(parse_address("0x+10").is_err());
+        assert!(parse_address("+10h").is_err());
+        assert!(parse_address("0x-10").is_err());
     }
 }

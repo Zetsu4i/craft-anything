@@ -157,6 +157,13 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
             app.state.screen = Screen::Home;
         }
         ui.label(theme::label_text("Craft Anything", label(12.0, s)).color(t.text).strong());
+        #[cfg(not(target_arch = "wasm32"))]
+        ui.menu_button(tr("Help"), |ui| {
+            if ui.button(tr("Check for Updates…")).clicked() {
+                app.updates.check(ui.ctx());
+                ui.close();
+            }
+        });
         let in_project = app.state.screen == Screen::Project;
         let project = if in_project { app.workspace.as_ref().map(|w| w.manifest.name.clone()) } else { app.view.project.clone() };
         let target = if in_project { None } else { app.view.active_target().map(|t| (t.name.clone(), t.kind)) };

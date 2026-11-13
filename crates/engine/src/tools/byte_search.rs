@@ -15,7 +15,7 @@ pub fn specs() -> Vec<ToolSpec> {
     vec![spec(
         "native_bytes_find",
         "Search for bytes",
-        "Find every place a byte signature or a piece of text occurs in a file (an absolute path, or the active target). `pattern` is hex byte pairs with `??` for any byte (spaces optional, e.g. `48 8B ?? 24`); `text` is searched as UTF-8 and/or UTF-16LE. Matches are ordered by file offset and paged (offset/limit); for ELF, PE and Mach-O programs each match also carries its virtual address and containing section when the bytes are mapped. Overlapping matches are all reported. Counting stops at 100000 matches.",
+        "Find every place a byte signature or a piece of text occurs in a file (an absolute path, or the active target). `pattern` is hex byte pairs with `??` for any byte (spaces optional, e.g. `48 8B ?? 24`); `text` is searched as UTF-8 and/or UTF-16LE. Matches are ordered by file offset and paged (offset/limit); for ELF, PE and Mach-O programs each match also carries its virtual address and containing section when the bytes are mapped. Overlapping matches are all reported. At most 100000 matches are retained, in file-offset order across all queries.",
         "Find where a byte pattern or a word appears inside a file.",
         Toolset::Native,
         Effects::EVIDENCE,
@@ -184,13 +184,16 @@ fn native_bytes_find(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
     let mut hits: Vec<(usize, usize, &'static str)> = Vec::new();
     let mut capped = false;
     for (what, pat) in &needles {
-        let room = MAX_MATCHES.saturating_sub(hits.len());
-        let (found, stopped) = find_all(&input.bytes, pat, room, &|| cancel.is_cancelled());
+        // A later query can have earlier matches even when the preceding query filled the cap.
+        // Its first MAX_MATCHES are sufficient to find the first MAX_MATCHES of the union.
+        let (found, stopped) = find_all(&input.bytes, pat, MAX_MATCHES, &|| cancel.is_cancelled());
         ctx.cancel.check()?;
         capped |= stopped;
         hits.extend(found.into_iter().map(|o| (o, pat.len(), *what)));
+        hits.sort_unstable();
+        capped |= hits.len() > MAX_MATCHES;
+        hits.truncate(MAX_MATCHES);
     }
-    hits.sort_unstable();
 
     let limit = p.limit.clamp(1, 1000);
     let rows: Vec<Hit> = hits

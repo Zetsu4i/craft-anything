@@ -8,6 +8,8 @@ use serde::Serialize;
 const MAX_DEPTH: usize = 32;
 /// Most certificates taken from one PKCS#7 blob.
 const MAX_CERTS: usize = 64;
+/// A readable encoding limitation, distinct from the result of a signature check.
+pub const NON_MINIMAL_LENGTH_NOTE: &str = "An element uses a non-minimal ASN.1 length; not strict DER.";
 
 /// One TLV: tag byte, and the content range within the input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +21,8 @@ pub struct Tlv {
     pub content: usize,
     /// Content length.
     pub len: usize,
+    /// The length uses a redundant long form or leading zero octet. Contents remain readable.
+    pub non_minimal_length: bool,
 }
 
 impl Tlv {
@@ -42,31 +46,61 @@ impl Tlv {
 }
 
 /// Read one TLV at `off`. Only single-byte tags and definite lengths of up to 4 bytes.
+/// Redundant length encodings are retained and flagged, rather than hiding their contents.
 pub fn read(data: &[u8], off: usize) -> Option<Tlv> {
     let tag = *data.get(off)?;
     if tag & 0x1f == 0x1f {
         return None;
     }
     let l0 = *data.get(off.checked_add(1)?)?;
-    let (len, hdr) = if l0 & 0x80 == 0 {
-        (usize::from(l0), 2usize)
+    let (len, hdr, non_minimal_length) = if l0 & 0x80 == 0 {
+        (usize::from(l0), 2usize, false)
     } else {
         let n = usize::from(l0 & 0x7f);
         if n == 0 || n > 4 {
             return None;
         }
+        let leading_zero = *data.get(off.checked_add(2)?)? == 0;
         let mut v = 0usize;
         for i in 0..n {
             v = v.checked_mul(256)?.checked_add(usize::from(*data.get(off.checked_add(2 + i)?)?))?;
         }
-        (v, 2 + n)
+        (v, 2 + n, leading_zero || v < 128)
     };
     let content = off.checked_add(hdr)?;
     let end = content.checked_add(len)?;
     if end > data.len() {
         return None;
     }
-    Some(Tlv { tag, start: off, content, len })
+    Some(Tlv { tag, start: off, content, len, non_minimal_length })
+}
+
+/// Whether a non-minimal length is found while walking constructed elements within the
+/// reader's depth/child limits and a 100,000-node budget. False is not a full DER validation.
+pub fn has_non_minimal_length(data: &[u8]) -> bool {
+    fn walk(data: &[u8], value: &Tlv, depth: usize, remaining: &mut usize) -> bool {
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        if value.non_minimal_length {
+            return true;
+        }
+        if depth >= MAX_DEPTH || !value.constructed() {
+            return false;
+        }
+        for child in children(data, value) {
+            if *remaining == 0 {
+                break;
+            }
+            if walk(data, &child, depth + 1, remaining) {
+                return true;
+            }
+        }
+        false
+    }
+    let mut remaining = 100_000;
+    read(data, 0).is_some_and(|value| walk(data, &value, 0, &mut remaining))
 }
 
 /// The children of a constructed TLV (stops at the first malformed child).
@@ -185,6 +219,28 @@ fn escaped_name_value(value: &str) -> String {
     out
 }
 
+/// Keep unsupported or malformed name values distinct instead of replacing their bytes.
+fn decoded_name_value(data: &[u8], value: &Tlv) -> String {
+    use std::fmt::Write;
+    let bytes = value.bytes(data).unwrap_or_default();
+    let decoded: Option<String> = match value.tag {
+        0x0c => std::str::from_utf8(bytes).ok().map(str::to_owned),
+        0x12 | 0x13 | 0x16 | 0x1a if bytes.is_ascii() => std::str::from_utf8(bytes).ok().map(str::to_owned),
+        0x14 => Some(bytes.iter().copied().map(char::from).collect()),
+        0x1e if bytes.len().is_multiple_of(2) => bytes.as_chunks::<2>().0.iter().map(|unit| char::from_u32(u32::from(u16::from_be_bytes(*unit)))).collect(),
+        0x1c if bytes.len().is_multiple_of(4) => bytes.as_chunks::<4>().0.iter().map(|unit| char::from_u32(u32::from_be_bytes(*unit))).collect(),
+        _ => None,
+    };
+    if let Some(decoded) = decoded {
+        return escaped_name_value(&decoded);
+    }
+    let mut encoded = String::from("#");
+    for byte in value.whole(data).unwrap_or_default() {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
 /// A distinguished name as `CN=…, O=…`.
 pub fn name(data: &[u8], seq: &Tlv) -> String {
     let mut parts = Vec::new();
@@ -195,7 +251,7 @@ pub fn name(data: &[u8], seq: &Tlv) -> String {
             if let (Some(o), Some(v)) = (kids.first(), kids.get(1)) {
                 let id = oid(o.bytes(data).unwrap_or(&[]));
                 let key = oid_name(&id).map(str::to_string).unwrap_or(id);
-                attributes.push(format!("{key}={}", escaped_name_value(&text(data, v))));
+                attributes.push(format!("{key}={}", decoded_name_value(data, v)));
             }
         }
         if !attributes.is_empty() {
@@ -217,6 +273,9 @@ pub struct CertInfo {
     pub signature_algorithm: String,
     pub public_key_algorithm: String,
     pub version: u8,
+    /// Encoding limitations that do not discard the readable certificate facts.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 fn alg(data: &[u8], seq: &Tlv) -> String {
@@ -239,6 +298,9 @@ pub fn certificate(data: &[u8]) -> Option<CertInfo> {
     let parts = children(data, &cert);
     let tbs = parts.first().filter(|t| t.tag == 0x30)?;
     let mut info = CertInfo { version: 1, ..CertInfo::default() };
+    if has_non_minimal_length(data) {
+        info.notes.push(NON_MINIMAL_LENGTH_NOTE.into());
+    }
     if let Some(sa) = parts.get(1) {
         info.signature_algorithm = alg(data, sa);
     }
@@ -273,26 +335,21 @@ pub fn certificate(data: &[u8]) -> Option<CertInfo> {
 
 /// The certificates (whole DER TLVs) inside a PKCS#7 SignedData blob, as in `META-INF/*.RSA`.
 pub fn pkcs7_certificates(data: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let Some(ci) = read(data, 0) else { return out };
+    let Some(ci) = read(data, 0).filter(|t| t.tag == 0x30) else { return Vec::new() };
     let kids = children(data, &ci);
     let is_signed = kids.first().is_some_and(|t| t.tag == 0x06 && oid(t.bytes(data).unwrap_or(&[])) == "1.2.840.113549.1.7.2");
     if !is_signed {
-        return out;
+        return Vec::new();
     }
-    let Some(explicit) = kids.get(1).filter(|t| t.tag == 0xa0) else { return out };
-    let Some(sd) = children(data, explicit).into_iter().next() else { return out };
-    for field in children(data, &sd) {
-        // certificates [0] IMPLICIT SET OF Certificate
-        if field.tag == 0xa0 {
-            for c in children(data, &field).into_iter().take(MAX_CERTS) {
-                if let Some(w) = c.whole(data) {
-                    out.push(w);
-                }
-            }
-        }
+    let Some(explicit) = kids.get(1).filter(|t| t.tag == 0xa0) else { return Vec::new() };
+    let Some(sd) = children(data, explicit).into_iter().next().filter(|t| t.tag == 0x30) else { return Vec::new() };
+    let fields = children(data, &sd);
+    let [version, digests, content, certificates, ..] = fields.as_slice() else { return Vec::new() };
+    if (version.tag, digests.tag, content.tag, certificates.tag) != (0x02, 0x31, 0x30, 0xa0) {
+        return Vec::new();
     }
-    out
+    // Only the untagged SEQUENCE choice is an X.509 certificate.
+    children(data, certificates).into_iter().filter(|t| t.tag == 0x30).take(MAX_CERTS).filter_map(|t| t.whole(data)).collect()
 }
 
 /// The dotted OID of an AlgorithmIdentifier SEQUENCE's first child (the algorithm OID).
@@ -315,6 +372,9 @@ pub struct CertParts<'a> {
     pub tbs: &'a [u8],
     /// The `signatureAlgorithm` OID (dotted).
     pub signature_algorithm: String,
+    /// The outer and signed AlgorithmIdentifier values, including their parameters.
+    pub signature_algorithm_der: &'a [u8],
+    pub signed_signature_algorithm_der: &'a [u8],
     /// The `signatureValue` BIT STRING contents (leading unused-bits byte stripped).
     pub signature: &'a [u8],
     /// The `subjectPublicKeyInfo` SEQUENCE (header included).
@@ -359,12 +419,68 @@ pub fn certificate_parts(data: &[u8]) -> Option<CertParts<'_>> {
     let issuer = f.get(i + 2).filter(|t| t.tag == 0x30).and_then(|t| t.whole(data))?;
     let subject = f.get(i + 4).filter(|t| t.tag == 0x30).and_then(|t| t.whole(data))?;
     let spki = f.get(i + 5).filter(|t| t.tag == 0x30).and_then(|t| t.whole(data))?;
-    Some(CertParts { tbs, signature_algorithm, signature, spki, issuer, subject, serial })
+    let signature_algorithm_der = sig_alg_seq.whole(data)?;
+    let signed_signature_algorithm_der = f.get(i + 1)?.whole(data)?;
+    Some(CertParts { tbs, signature_algorithm, signature_algorithm_der, signed_signature_algorithm_der, signature, spki, issuer, subject, serial })
 }
 
 /// The `subjectPublicKeyInfo` SEQUENCE of a certificate (header included).
 pub fn certificate_spki(data: &[u8]) -> Option<&[u8]> {
     certificate_parts(data).map(|p| p.spki)
+}
+
+/// The subject key identifier extension's OCTET STRING, when one complete extension supplies it.
+pub fn certificate_subject_key_identifier(data: &[u8]) -> Option<&[u8]> {
+    let tbs = certificate_parts(data)?.tbs;
+    let fields = children(tbs, &read(tbs, 0)?);
+    if fields.last().is_none_or(|last| last.end() != tbs.len()) {
+        return None;
+    }
+    let mut wrappers = fields.iter().filter(|field| field.tag == 0xa3);
+    let wrapper = wrappers.next()?;
+    if wrappers.next().is_some() {
+        return None;
+    }
+    let sequence = read(tbs, wrapper.content)?;
+    if sequence.tag != 0x30 || sequence.end() != wrapper.end() {
+        return None;
+    }
+    let extensions = children(tbs, &sequence);
+    if extensions.last().is_none_or(|last| last.end() != sequence.end()) {
+        return None;
+    }
+    let mut key_id = None;
+    for extension in extensions {
+        if extension.tag != 0x30 {
+            return None;
+        }
+        let fields = children(tbs, &extension);
+        let Some(id) = fields.first().filter(|field| field.tag == 0x06).and_then(|field| field.bytes(tbs)) else { continue };
+        if oid(id) != "2.5.29.14" {
+            continue;
+        }
+        if key_id.is_some() || fields.last().is_none_or(|last| last.end() != extension.end()) {
+            return None;
+        }
+        let value_index = if let Some(critical) = fields.get(1).filter(|field| field.tag == 0x01) {
+            if !matches!(critical.bytes(tbs)?, [0] | [0xff]) {
+                return None;
+            }
+            2
+        } else {
+            1
+        };
+        if fields.len() != value_index + 1 {
+            return None;
+        }
+        let encoded = fields.get(value_index).filter(|field| field.tag == 0x04)?.bytes(tbs)?;
+        let value = read(encoded, 0)?;
+        if value.tag != 0x04 || value.end() != encoded.len() {
+            return None;
+        }
+        key_id = Some(value.bytes(encoded)?);
+    }
+    key_id
 }
 
 /// Split a `subjectPublicKeyInfo` into `(algorithm OID, public-key BIT STRING contents)`.
@@ -533,6 +649,71 @@ mod tests {
         let certs = pkcs7_certificates(&p7);
         assert_eq!(certs, vec![cert.as_slice()]);
         assert!(count_nodes(&p7) > 10);
+    }
+
+    #[test]
+    fn only_x509_choices_in_the_certificate_field_are_returned() {
+        let mut choices = vec![0xa2, 0x00];
+        for i in 0..70 {
+            choices.extend_from_slice(&[0x30, 3, 2, 1, i]);
+        }
+        let cms = craft_anything_testkit::android::pkcs7_der(&choices);
+        let certs = pkcs7_certificates(&cms);
+        assert_eq!(certs.len(), MAX_CERTS);
+        assert_eq!(certs[0], [0x30, 3, 2, 1, 0]);
+        assert_eq!(certs[MAX_CERTS - 1], [0x30, 3, 2, 1, 63]);
+
+        let ci = children(&cms, &read(&cms, 0).unwrap());
+        let sd = children(&cms, &ci[1])[0];
+        let fields = children(&cms, &sd);
+        for (offset, tag) in [(0, 0x31), (sd.start, 0x31), (fields[0].start, 0x04), (fields[3].start, 0xa1)] {
+            let mut damaged = cms.clone();
+            damaged[offset] = tag;
+            assert!(pkcs7_certificates(&damaged).is_empty());
+        }
+    }
+
+    #[test]
+    fn der_lengths_retain_contents_and_mark_non_minimal_encodings() {
+        for (header, len, non_minimal) in [
+            (&[0x04, 0x00][..], 0, false),
+            (&[0x04, 0x81, 0x00], 0, true),
+            (&[0x04, 0x7f], 127, false),
+            (&[0x04, 0x81, 0x7f], 127, true),
+            (&[0x04, 0x81, 0x80], 128, false),
+            (&[0x04, 0x82, 0x00, 0x80], 128, true),
+            (&[0x04, 0x82, 0x01, 0x00], 256, false),
+            (&[0x04, 0x83, 0x00, 0x01, 0x00], 256, true),
+        ] {
+            let mut data = header.to_vec();
+            data.resize(header.len() + len, 0);
+            let value = read(&data, 0).unwrap();
+            assert_eq!(value.len, len);
+            assert_eq!(value.non_minimal_length, non_minimal);
+            assert_eq!(value.bytes(&data), Some(&data[header.len()..]));
+            assert_eq!(has_non_minimal_length(&data), non_minimal);
+        }
+    }
+
+    #[test]
+    fn length_inspection_is_bounded_and_does_not_decode_primitive_payloads() {
+        use craft_anything_testkit::android::der;
+        let redundant = [0x04, 0x81, 0];
+        assert!(has_non_minimal_length(&der(0x30, &redundant)));
+        assert!(!has_non_minimal_length(&der(0x04, &redundant)));
+        let mut nested = redundant.to_vec();
+        for _ in 0..MAX_DEPTH {
+            nested = der(0x30, &nested);
+        }
+        assert!(has_non_minimal_length(&nested));
+        nested = der(0x30, &nested);
+        assert!(!has_non_minimal_length(&nested));
+        let branch = der(0x30, &[0x05, 0].repeat(4095));
+        let over_budget = der(0x30, &[branch.repeat(25), redundant.to_vec()].concat());
+        assert!(!has_non_minimal_length(&over_budget));
+        for invalid in [&[0x04, 0x80][..], &[0x04, 0x85, 0, 0, 0, 0, 0], &[0x04, 0x82, 0], &[0x04, 0x81, 0x7f]] {
+            assert!(read(invalid, 0).is_none());
+        }
     }
 
     #[test]

@@ -652,6 +652,12 @@ pub struct Workspace {
     pub manifest: Manifest,
 }
 
+/// The absolute form of a project path, for a child that changes into the project folder. An
+/// already-absolute path is kept; one that can't be made absolute is returned unchanged.
+pub fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// A folder-name slug: lower-case words joined by dashes, at most 40 characters.
 pub fn slug(s: &str) -> String {
     let mut out = String::new();

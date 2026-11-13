@@ -1467,3 +1467,24 @@ Connecting to {name}… {seconds} s	正在連線 {name}… {seconds} 秒
 Stopped adding {name}.	已停止新增 {name}。
 It isn't there any more, so {program} runs in its place.	它已不在那裡，因此改用 {program}。
 Use it	使用它
+
+# Native update checks and verified installation.
+ArtCraft Launcher manages this app's version. Change its version there.	ArtCraft Launcher 管理此應用程式的版本。請在那裡變更版本。
+Check again	再次檢查
+Check for Updates	檢查更新
+Check for Updates…	檢查更新…
+Checking for updates…	正在檢查更新…
+Couldn't check for updates: {error}	無法檢查更新：{error}
+Downloading and verifying the update…	正在下載並驗證更新…
+No installer is available for this platform.	此平台沒有可用的安裝程式。
+Releases	發行版本
+Save your work and stop running tasks before installing an update.	安裝更新前，請儲存工作並停止正在執行的工作。
+The update failed: {error}	更新失敗：{error}
+The update worker stopped unexpectedly. Try checking again.	更新工作執行緒意外停止。請重新檢查。
+This installation is managed externally. Update it with its package manager or open Releases.	此安裝由外部管理。請使用套件管理器更新，或開啟「發行版本」。
+Update and restart	更新並重新啟動
+Update ready. Restarting…	更新已就緒。正在重新啟動…
+Updated to {version}.	已更新至 {version}。
+Use Releases or your package manager to update this installation.	請透過「發行版本」或套件管理器更新此安裝。
+You're up to date.	已是最新版本。
+{version} is available.	{version} 已可用。

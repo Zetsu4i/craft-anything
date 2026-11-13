@@ -88,8 +88,17 @@ impl AgentAdapter for OpenCode {
         }
         a.extend(cx.options.args.iter().cloned());
         a.extend(["--format".into(), "json".into()]);
-        a.push(format!("{}{}", cx.preamble, cx.prompt));
         a
+    }
+
+    /// `opencode run` with no message argument reads it from stdin (V1 and V2 alike), so a long
+    /// one can't pass Windows' command-line limit (os error 206, #402).
+    fn prompt_on_stdin(&self) -> bool {
+        true
+    }
+
+    fn stdin_text(&self, preamble: &str, prompt: &str) -> String {
+        format!("{preamble}{prompt}")
     }
 
     fn required_flags(&self) -> (&'static [&'static str], &'static [&'static str]) {
@@ -132,6 +141,14 @@ impl AgentAdapter for OpenCode {
 
     fn discards_sessions(&self) -> bool {
         true
+    }
+
+    /// OpenCode 1.x has no `--standalone` and rejects it, so it's refused before it runs (#1111).
+    fn missing_flags_error(&self) -> Option<(&'static str, &'static str)> {
+        Some((
+            "This OpenCode's `run --help` doesn't list --standalone, so it looks like OpenCode 1.x. Craft Anything needs OpenCode 2.",
+            "Install OpenCode 2 (`npm install -g @opencode/cli`) and remove the old `opencode-ai` package, or choose the OpenCode 2 program in Settings → AI.",
+        ))
     }
 
     fn parse(&self, p: &mut StreamParser, v: &Value) -> Vec<AgentEvent> {
@@ -308,14 +325,13 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_goes_to_run_after_the_flags() {
-        assert_eq!(args(false, &BackendOptions::default()), ["run", "--standalone", "--format", "json", "PRE make a game"]);
+    fn the_prompt_goes_to_run_on_stdin() {
+        assert_eq!(args(false, &BackendOptions::default()), ["run", "--standalone", "--format", "json"]);
         let options =
             BackendOptions { cli_model: Some("anthropic/claude-sonnet-4-5".into()), args: vec!["--agent".into(), "build".into()], ..Default::default() };
-        assert_eq!(
-            args(true, &options),
-            ["run", "--standalone", "--auto", "--model", "anthropic/claude-sonnet-4-5", "--agent", "build", "--format", "json", "PRE make a game"]
-        );
+        assert_eq!(args(true, &options), ["run", "--standalone", "--auto", "--model", "anthropic/claude-sonnet-4-5", "--agent", "build", "--format", "json"]);
+        assert!(OpenCode.prompt_on_stdin());
+        assert_eq!(OpenCode.stdin_text("PRE ", "make a game"), "PRE make a game");
         assert!(AgentAdapters::built_in().for_agent("opencode").ids().contains(&"opencode"), "registered, not the plain adapter");
     }
 
@@ -554,7 +570,7 @@ mod tests {
                 let argv = args(builder, &options);
                 let model = argv.iter().position(|a| a == "--model").unwrap();
                 assert_eq!(argv[model + 1], format!("test/model#{}", depth.as_str()));
-                assert_eq!(argv.last().unwrap(), "PRE make a game");
+                assert!(!argv.iter().any(|a| a.contains("make a game")), "the message goes on stdin");
             }
         }
         let argv = args(false, &BackendOptions::default());

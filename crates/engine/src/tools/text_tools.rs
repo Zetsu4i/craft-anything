@@ -6,7 +6,7 @@
 use super::native_common::{params_json, spec};
 use super::static_input::{self, builder};
 use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
-use craft_anything_evidence::{Authority, Confidence, Coverage, ErrorCode, Limitation, Location, ToolError};
+use craft_anything_evidence::{Authority, Confidence, Coverage, CoverageStatus, ErrorCode, Limitation, Location, ToolError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -209,7 +209,11 @@ fn core_text_read(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolEr
     } else {
         format!("{}: lines {}–{end} of {total} ({}).", input.name, start.saturating_add(1), d.encoding.name())
     };
-    let coverage = if total == 0 { Coverage::complete(0) } else { Coverage::page(pg.lines as u64, total as u64, start as u64) };
+    let mut coverage = if total == 0 { Coverage::complete(0) } else { Coverage::page(pg.lines as u64, total as u64, start as u64) };
+    // Reaching the last line does not restore the contents omitted by the line-size limit.
+    if !pg.cut.is_empty() {
+        coverage.status = CoverageStatus::Partial;
+    }
     let ev = builder(ctx, TEXT_READ_TOOL, input.subject.clone(), params_json(&p))
         .result(json!({
             "path": input.path,

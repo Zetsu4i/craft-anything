@@ -360,6 +360,38 @@ fn a_launcher_leads_to_the_game_and_its_files() {
 }
 
 #[test]
+fn a_mac_app_bundle_is_studied_through_the_program_it_names() {
+    let d = tempfile::tempdir().unwrap();
+    // The executable's name differs from the bundle's, and a bigger helper sits beside it.
+    let app = d.path().join("Tip Calculator.app");
+    let macos = app.join("Contents/MacOS");
+    std::fs::create_dir_all(&macos).unwrap();
+    std::fs::write(
+        app.join("Contents/Info.plist"),
+        r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>TipCalc</string></dict></plist>"#,
+    )
+    .unwrap();
+    std::fs::write(macos.join("TipCalc"), b"\xcf\xfa\xed\xfe").unwrap();
+    std::fs::write(macos.join("Helper"), vec![0u8; 4096]).unwrap();
+    assert_eq!(locate(&app, "app"), (macos.join("TipCalc"), None), "the program Info.plist names");
+
+    // Without an Info.plist, the program named like the bundle.
+    let bare = d.path().join("Notes.APP");
+    std::fs::create_dir_all(bare.join("Contents/MacOS")).unwrap();
+    std::fs::write(bare.join("Contents/MacOS/Notes"), b"\xcf\xfa\xed\xfe").unwrap();
+    assert_eq!(locate(&bare, "app").0, bare.join("Contents/MacOS/Notes"));
+
+    // A bundle with no program in it, and a folder that isn't a bundle, stay as picked.
+    let empty = d.path().join("Empty.app");
+    std::fs::create_dir_all(empty.join("Contents/MacOS")).unwrap();
+    assert_eq!(locate(&empty, "app"), (empty.clone(), None));
+    let plain = d.path().join("TipCalc");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(plain.join("TipCalc"), b"\xcf\xfa\xed\xfe").unwrap();
+    assert_eq!(locate(&plain, "app"), (plain.clone(), None), "only an app bundle is looked inside");
+}
+
+#[test]
 fn engine_stacks_get_their_own_steps_checks_and_play() {
     let ed = Path::new("C:/Engines/Unity/Editor/Unity.exe");
     let unity = stack_steps("Unity", Some(ed));
@@ -1038,8 +1070,9 @@ mod typed_retries {
             &ws,
             "opencode",
             concat!(
-                "#!/bin/sh\nif [ \"$2\" = '--help' ]; then printf '%s\\n' '--format'; exit 0; fi\n",
-                "for arg do last=\"$arg\"; done\nprintf '%s\\n' \"$last\" >> prompts\n",
+                "#!/bin/sh\nif [ \"$2\" = '--help' ]; then printf '%s\\n' '--format --standalone'; exit 0; fi\n",
+                // The message comes on stdin.
+                "cat >> prompts; printf '\\n' >> prompts\n",
                 "if [ ! -f rate-was-returned ]; then touch rate-was-returned\n",
                 "printf '%s\\n' '{\"type\":\"error\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Please retry in 19.052906498s.\",\"statusCode\":429,\"isRetryable\":true}}}'\nexit 1\nfi\n",
                 "printf '%s\\n' '{\"type\":\"text\",\"part\":{\"text\":\"Built the app\"}}'\n"
@@ -1073,7 +1106,7 @@ mod typed_retries {
         let mut cli = executable_cli(
             &ws,
             "opencode",
-            "#!/bin/sh\nif [ \"$2\" = '--help' ]; then printf 'old help\\n'; exit 0; fi\nprintf 'attempt\\n' >> attempts\nprintf 'Unknown option: --format. Please retry in 1s.\\n' >&2\nexit 2\n",
+            "#!/bin/sh\nif [ \"$2\" = '--help' ]; then printf '%s\\n' '--format --standalone'; exit 0; fi\nprintf 'attempt\\n' >> attempts\nprintf 'Unknown option: --model. Please retry in 1s.\\n' >&2\nexit 2\n",
         );
         let mut waits = Vec::new();
         let error = worker
@@ -1187,8 +1220,12 @@ fn needs_an_agent_app() {
     let d = tempfile::tempdir().unwrap();
     let hub = AiHub::with_stores(engine, d.path().join("settings.toml"), crate::KeyStore::file_only(d.path().join("keys.toml")));
     let ws = Workspace::create(d.path(), "x", "y", TargetRef::None).unwrap();
+    let dir = notes::notes_dir(&ws.inbox_dir());
+    let left = notes::Left { text: "make it blue".into(), shown: "make it blue".into(), pictures: Vec::new() };
+    notes::hand_over(&dir, 1, "make it blue", Some(&left)).unwrap();
     let err = RebuildRun::start(&hub, ws, RunOptions::default()).err().unwrap();
     assert!(err.message.contains("coding agent"), "{}", err.message);
+    assert!(dir.join("1.json").is_file(), "a run that can't start leaves an earlier run's notes waiting (#1620)");
 }
 
 /// A fork's own kind: recognised from its words, with its own stack and check.
@@ -1911,7 +1948,7 @@ mod picking_up_a_build {
         let agent = b._dir.path().join("agent.sh");
         let works = std::fs::read_to_string(&agent).unwrap().replacen(
             "#!/bin/sh\n",
-            "#!/bin/sh\nif [ \"$2\" = '--help' ]; then printf '%s\\n' '--format'; exit 0; fi\n",
+            "#!/bin/sh\nif [ \"$2\" = '--help' ]; then printf '%s\\n' '--format --standalone'; exit 0; fi\n",
             1,
         );
         let error = json!({"type":"error","error":{"name":"APIError","data":{"message":"fixture sign in needed","statusCode":401,"isRetryable":false}}});
@@ -2206,7 +2243,7 @@ mod picking_up_a_build {
                 if self.add && self.script.seen.lock().unwrap().len() == 1 {
                     self.notes.lock().unwrap().push(note(self.text));
                     if self.claim {
-                        notes::hand_over(&self.dir, 42, self.text).unwrap();
+                        notes::hand_over(&self.dir, 42, self.text, None).unwrap();
                         assert_eq!(notes::claim(&self.dir), [self.text]);
                     }
                 }
@@ -2769,7 +2806,8 @@ fn a_saved_asset_key_gets_an_api_builders_tool_past_the_key_check() {
     assert!(worker.assets, "the brief and the tools go by the same read");
 }
 
-fn check_worker(ws: &Workspace, deep: bool) -> Worker {
+/// A worker over a test session and the workspace's feed, for check tests.
+pub(crate) fn check_worker(ws: &Workspace, deep: bool) -> Worker {
     let mut s = craft_anything_engine::testing::session();
     s.settings.deep_mode = deep;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -2790,6 +2828,35 @@ fn check_worker(ws: &Workspace, deep: bool) -> Worker {
         reset_progress_after_notes: false,
         keys: crate::KeyStore::file_only(ws.root.join("keys.toml")),
         kept_checks: Mutex::default(),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn console_study_keeps_two_real_observations_for_each_input() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let program = d.path().join("counter-tool");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\nn=0\nif [ -f run-count.txt ]; then read -r n < run-count.txt; fi\nn=$((n + 1))\nprintf '%s\\n' \"$n\" > run-count.txt\nprintf 'Result 42 completed in %s ms\\n' \"$n\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let ws = Workspace::create(d.path(), "Counter", "Rebuild this console tool", TargetRef::Local { path: program.clone() }).unwrap();
+    let worker = check_worker(&ws, true);
+    worker.capture_runs(&program, &ws.capture_dir()).unwrap();
+    let records = kinds::runs::captured(&ws);
+    assert_eq!(records.len(), kinds::runs::CASES.len());
+    assert_eq!(std::fs::read_to_string(d.path().join("run-count.txt")).unwrap().trim(), "6");
+    for record in records {
+        assert_eq!(record["reason"], "exited");
+        assert_eq!(record["repeat"]["reason"], "exited");
+        assert_ne!(record["lines"], record["repeat"]["lines"]);
+        let built = json!({"reason":"exited", "exit_code":0, "lines":["Result 42 completed in 999 ms"]});
+        assert!(kinds::runs::run_claims(&record, &built, &[]).iter().all(|c| c.passed));
+        let wrong = json!({"reason":"exited", "exit_code":0, "lines":["Result -42 completed in 999 ms"]});
+        assert!(!kinds::runs::run_claims(&record, &wrong, &[])[1].passed);
     }
 }
 
@@ -3711,8 +3778,8 @@ fn a_note_the_builder_took_at_a_step_joins_the_feed_and_isnt_sent_again() {
         reset_progress_after_notes: false,
     };
     let dir = notes::notes_dir(&ws.inbox_dir());
-    notes::hand_over(&dir, 1, "make the header blue").unwrap();
-    notes::hand_over(&dir, 2, "add a footer").unwrap();
+    notes::hand_over(&dir, 1, "make the header blue", None).unwrap();
+    notes::hand_over(&dir, 2, "add a footer", None).unwrap();
     // The agent's hook takes the first one at a step; the second comes in after it.
     std::fs::rename(dir.join("2.json"), dir.join("2.wait")).unwrap();
     assert_eq!(notes::claim(&dir), ["make the header blue"]);
@@ -3797,6 +3864,54 @@ fn starting_a_project_at_existing_project_folder_attaches_to_it() {
     let reattached = project::new_project(&session.settings, "-", "Follow up", project::Place::At(&folder, None), None, false, None).unwrap();
     assert_eq!(reattached.root, folder);
     assert_eq!(reattached.manifest.name, ws.manifest.name);
+}
+
+/// #987 made a folder that already holds a project attach to it. Attaching must not treat the
+/// project as new: its saved builder, asset budget, generate_assets and stack stay, and the typed
+/// request becomes a follow-up instead of being dropped.
+#[test]
+fn reattaching_keeps_the_projects_saved_settings() {
+    let session = craft_anything_engine::testing::session();
+    let d = tempfile::tempdir().unwrap();
+    let folder = d.path().join("mine");
+    let mut ws = project::new_project(&session.settings, "-", "Initial app", project::Place::At(&folder, None), None, false, Some("Claude")).unwrap();
+    ws.set_person(|m| {
+        m.asset_budget_usd = 42.0;
+        m.generate_assets = true;
+        m.builder = Some("Claude".into());
+    })
+    .unwrap();
+    ws.manifest.stack = "Godot".into();
+    ws.save().unwrap();
+
+    let reattached = project::new_project(&session.settings, "-", "Add a jump", project::Place::At(&folder, None), Some("unity"), false, None).unwrap();
+    assert_eq!(reattached.manifest.builder.as_deref(), Some("Claude"), "the saved builder is kept");
+    assert_eq!(reattached.manifest.asset_budget_usd, 42.0, "the saved asset budget is kept");
+    assert!(reattached.manifest.generate_assets, "the saved asset setting is kept");
+    assert_eq!(reattached.manifest.stack, "Godot", "the saved stack is kept");
+    assert_eq!(reattached.manifest.request, "Initial app", "the project's original request stays");
+    assert!(project::has_project(&folder), "the folder is now a project");
+    assert_eq!(
+        project::attached_request(project::has_project(&folder), "Add a jump").as_deref(),
+        Some("Add a jump"),
+        "a request typed for an attached project is its follow-up"
+    );
+    assert_eq!(project::attached_request(false, "A new app"), None, "a new project's request stays its own");
+}
+
+/// A folder that doesn't hold a project yet is created with the stack, builder, asset budget and
+/// generate_assets it was started with; only an attached folder keeps what it had.
+#[test]
+fn a_new_project_gets_the_settings_it_started_with() {
+    let session = craft_anything_engine::testing::session();
+    let d = tempfile::tempdir().unwrap();
+    let folder = d.path().join("new");
+    let ws = project::new_project(&session.settings, "-", "A game", project::Place::At(&folder, None), Some("godot"), true, Some("Claude")).unwrap();
+    assert_eq!(ws.manifest.stack, "Godot", "the picked stack is written");
+    assert_eq!(ws.manifest.builder.as_deref(), Some("Claude"), "the picked builder is written");
+    assert!(ws.manifest.generate_assets, "the asset choice is written");
+    assert_eq!(ws.manifest.asset_budget_usd, session.settings.assets.budget(), "the budget comes from settings");
+    assert_eq!(ws.manifest.request, "A game");
 }
 
 #[test]

@@ -140,12 +140,22 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
     crate::bytes::decode_base64(text, false)
 }
 
-/// An Apple absolute time (seconds since 2001-01-01Z) as ISO-8601 UTC.
+/// An Apple absolute time (seconds since 2001-01-01Z) as ISO-8601 UTC, rounded to microseconds.
 pub fn apple_date_iso(secs: f64) -> String {
     if !secs.is_finite() || secs.abs() > 1e13 {
         return format!("{secs}");
     }
-    let unix = secs.floor() as i64 + 978_307_200;
+    // Separate the fraction before adding the epoch offset, which would otherwise lose
+    // precision for small intervals. Microseconds avoid displaying the floating-point noise
+    // of contemporary dates as nanosecond precision. Floor keeps pre-epoch fractions in the
+    // preceding second.
+    let whole = secs.floor();
+    let mut micros = ((secs - whole) * 1_000_000.0).round() as u32;
+    let mut unix = whole as i64 + 978_307_200;
+    if micros == 1_000_000 {
+        unix += 1;
+        micros = 0;
+    }
     let days = unix.div_euclid(86_400);
     let rem = unix.rem_euclid(86_400);
     // Civil date from days since 1970-01-01.
@@ -159,12 +169,25 @@ pub fn apple_date_iso(secs: f64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+    let fraction = if micros == 0 { String::new() } else { format!(".{micros:06}").trim_end_matches('0').to_string() };
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}{fraction}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 /// True when the bytes look like a property list of either kind.
 pub fn looks_like_plist(data: &[u8]) -> bool {
-    (data.len() >= 8 && data.starts_with(b"bplist0")) || data.iter().take(1024).copied().collect::<Vec<u8>>().windows(6).any(|w| w == b"<plist")
+    if data.len() >= 8 && data.starts_with(b"bplist0") {
+        return true;
+    }
+    let prefix = &data[..data.len().min(1024)];
+    let (body, marker): (&[u8], &[u8]) = if let Some(body) = prefix.strip_prefix(&[0xff, 0xfe]) {
+        (body, b"<\0p\0l\0i\0s\0t\0")
+    } else if let Some(body) = prefix.strip_prefix(&[0xfe, 0xff]) {
+        (body, b"\0<\0p\0l\0i\0s\0t")
+    } else {
+        return prefix.windows(6).any(|w| w == b"<plist");
+    };
+    // XML detection must agree with parse_xml's BOM decoding, including code-unit alignment.
+    body.windows(marker.len()).step_by(2).any(|w| w == marker)
 }
 
 /// Parse a binary or XML property list.
@@ -541,7 +564,21 @@ fn tokenize(text: &str) -> Result<Vec<Tok>, FormatError> {
             rest = after_declaration(declaration)?;
             continue;
         }
-        let e = rest.find('>').ok_or_else(|| FormatError::Truncated("tag".into()))?;
+        let mut quote = None;
+        let e = rest
+            .find(|ch| match (quote, ch) {
+                (Some(q), c) if q == c => {
+                    quote = None;
+                    false
+                }
+                (None, '\'' | '"') => {
+                    quote = Some(ch);
+                    false
+                }
+                (None, '>') => true,
+                _ => false,
+            })
+            .ok_or_else(|| FormatError::Truncated("tag".into()))?;
         let inner = rest.get(1..e).unwrap_or("").trim();
         rest = rest.get(e + 1..).unwrap_or("");
         if let Some(name) = inner.strip_prefix('/') {
@@ -707,6 +744,9 @@ pub fn parse_xml(data: &[u8]) -> Result<Value, FormatError> {
             .map_err(|_| FormatError::Malformed("invalid UTF-8 in XML plist".into()))?
             .to_owned(),
     };
+    // XML normalizes literal line endings before parsing; character references such as
+    // &#13; must still decode to a carriage return afterwards.
+    let text = if text.contains('\r') { text.replace("\r\n", "\n").replace('\r', "\n") } else { text };
     let toks = tokenize(&text)?;
     let mut x = Xml { toks, pos: 0, nodes: 0 };
     x.skip_space();

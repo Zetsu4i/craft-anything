@@ -302,14 +302,16 @@ pub(super) const NO_PROGRAM: &str = "There's no built program to start yet.";
 /// removed first, so only this run's counts).
 pub(super) fn run_with(cx: &CheckCx, option: &str, file: &Path) -> Result<OwnRun, ToolError> {
     let app = cx.ws.app_dir();
+    let file = craft_anything_engine::workspace::absolute(file);
     let godot = cx.godot();
     let Some((program, args)) = launch(&app, godot.as_deref()) else { return Ok(OwnRun::NoProgram) };
+    let program = craft_anything_engine::outputs::absolute_program(&program);
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir).map_err(|e| ToolError::io(dir.display(), e))?;
     }
-    let _ = std::fs::remove_file(file);
+    let _ = std::fs::remove_file(&file);
     let mut with = args.clone();
-    with.extend(option_args(godot.is_some() && app.join("project.godot").is_file(), option, file));
+    with.extend(option_args(godot.is_some() && app.join("project.godot").is_file(), option, &file));
     // A round with a time limit (the builder's own checks) cuts this run at the limit, instead of
     // waiting out its own 90 s. A pause stops it now, and neither a pause nor a passed limit ever
     // starts the program.
@@ -320,7 +322,11 @@ pub(super) fn run_with(cx: &CheckCx, option: &str, file: &Path) -> Result<OwnRun
     let Ok(bytes) = std::fs::read(file) else {
         let why = match &out {
             Ok(o) if !o.success => {
-                format!(" It exited with {}: {}", o.code.map_or("an error".into(), |c| format!("code {c}")), last_lines(&o.stderr_text(), &o.stdout_text()))
+                format!(
+                    " It exited with {}: {}",
+                    o.code.map_or("an error".into(), |c| format!("code {c}")),
+                    last_lines(&o.stderr_end_text(), &o.stdout_end_text())
+                )
             }
             Err(e) => format!(" {}", e.message),
             Ok(_) => String::new(),
@@ -465,6 +471,34 @@ mod tests {
         let p = Path::new("/p/checks/round-1/screenshot.png");
         assert_eq!(option_args(false, "--screenshot", p), ["--screenshot", "/p/checks/round-1/screenshot.png"]);
         assert_eq!(option_args(true, "--screenshot", p).first().map(String::as_str), Some("--"));
+    }
+
+    /// A relative project must start its program and pass its option file as absolute paths; the
+    /// child's working folder is app/, so a relative path would be resolved inside app/ again.
+    #[cfg(unix)]
+    #[test]
+    fn option_runs_use_absolute_program_and_file_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cwd = std::env::current_dir().unwrap();
+        let d = tempfile::tempdir_in(&cwd).unwrap();
+        let relative = d.path().strip_prefix(&cwd).unwrap();
+        let ws = Workspace::create(relative, "Game", "a game", TargetRef::None).unwrap();
+        let app = ws.app_dir();
+        std::fs::create_dir_all(app.join("target/debug")).unwrap();
+        std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"game\"\n").unwrap();
+        let program = app.join("target/debug/game");
+        std::fs::write(&program, "#!/bin/sh\nprintf 'saved' > \"$2\"\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let worker = crate::rebuild::tests::check_worker(&ws, false);
+        let cx = CheckCx { worker: &worker, ws: &ws, round: 1, until: None };
+        let file = ws.checks_dir().join("round-1/screenshot.bin");
+        match run_with(&cx, "--screenshot", &file).unwrap() {
+            OwnRun::Saved { bytes, .. } => assert_eq!(bytes, b"saved"),
+            OwnRun::NoProgram => panic!("the built program was found"),
+            OwnRun::NoFile(why) => panic!("the option run saved its file: {why}"),
+        }
     }
 
     #[test]

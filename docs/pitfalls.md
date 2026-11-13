@@ -87,6 +87,11 @@ names (`git merge-base --is-ancestor <fix> <release tag>`), and check the messag
 
 ## Tests
 
+**A TLS fixture closed before the handshake.** Accepted sockets inherited the listener's
+nonblocking mode on Windows, so the fixture read `WouldBlock` and closed a valid connection.
+Set the accepted socket to blocking mode before applying bounded I/O timeouts; consume the
+complete request header before replying.
+
 **A heartbeat sampled before shutdown raced a successful stop.** A child could write between
 the baseline read and `stop()`, failing the descendant cleanup test even when cleanup worked.
 Probe for exit instead of timing writes: the child holds a file lock the system releases only
@@ -199,6 +204,11 @@ off the UI thread; a UI test that added pictures, ran three frames and then look
 fast machines and failed in CI on unrelated PRs. When work moves to a worker, grep the tests that
 call it and make them `wait` for the result, not `run_steps(n)`.
 
+**A stand-in server that answers every request in order.** The AI tests' `mock` answered each
+request with the next scripted reply, so when the agent began asking the server for its context
+window before the first chat, that question took the chat's reply. A stand-in says which requests
+it was scripted for and answers anything else as a real server that doesn't know would.
+
 ## Building and running
 
 **A documentation edit rebuilt dependencies in a separate cache.** A sequential review follow-up
@@ -214,6 +224,9 @@ project placement, the selected virtualenv interpreter and artifact paths stayed
 PATH lookup can return a relative path too. Resolve workspace paths against the process's
 current directory, look up only bare program names, and make the result absolute without
 dereferencing the virtualenv symlink. Test the generated capture request without opening a GUI.
+The same rule covers every child started in app/: engine build arguments, option files, console
+run checks, Play and pins must get absolute program, working-directory and path arguments; a
+relative one is resolved against app/ again.
 
 **A screenshot helper aborted inside CoreGraphics.** The first macOS screenshot probe used
 ScreenCaptureKit from a command-line Swift helper without initializing AppKit's WindowServer
@@ -447,6 +460,13 @@ with `create_new` in `ghidra-cache/`, which only existed on machines that had us
 fresh store the create failed and the loop read that as "someone else holds it" until the
 deadline. Create a lock's folder first, and treat any error but "already exists" as a failure.
 
+**A bound read from an analysis that never saw the code.** Ghidra's unguarded jump tables were
+first ended at the next address something refers to; a hand-made ELF passed, but in a real Rust
+program the code holding the next table's `lea` is reached only through the table being bounded,
+so it was never disassembled, nothing referred to the next table and the bound took all 256
+entries. When a fix leans on what an analysis found, ask whether the thing being fixed is why it
+found nothing, and run it on a real program, not only on one built for the test.
+
 **A bridge that didn't compile.** A helper in the Ghidra bridge was named like a public
 `GhidraScript` method, so Ghidra refused the script and the run only said the bridge stopped.
 Compile the `.java` against Ghidra's jars (`javac -proc:none -cp <Ghidra/**/lib/*.jar>`) before a
@@ -489,6 +509,12 @@ merge state. Without CI, run its steps locally with `--locked`; a Mac can compil
 systems with `cargo check --target`, with zig as the C compiler for `ring` (a wrapper that drops the
 `--target=` flag `cc` adds), but that only proves it compiles.
 
+**A "required" switch read only on the failure path.** The build script looked at
+`CRAFT_FONTS_REQUIRED` only when `CRAFT_FONTS_DIR` was set and bad; with the folder variable
+missing, a build told the fonts were required finished with none embedded, and Korean showed as
+boxes. A requirement is checked on every path that ends without the thing, the missing input first;
+keep the decision in a function a test can call (`plan` in `crates/ui-egui/build.rs`).
+
 **Unformatted code reached `main`.** A test was edited by script after `cargo fmt --all` had run,
 so #53 merged with a long line rustfmt rewraps. Run `cargo fmt --all --check` last, after every
 edit, right before committing.
@@ -505,6 +531,47 @@ but POSIX makes everything after `=` the header, so FreeBSD's `ps` printed one `
 when a header is renamed or blanked.
 
 ## Design
+
+**A source inventory limit came after expansion.** Taking five thousand names after collecting
+every source path copied a large `sourceRoot` into every entry first. Count retained entries and
+expanded UTF-8 bytes before allocating each path, share the budget across indexed sections and
+application maps, and report when only a prefix could be kept. A source identity stays complete;
+shortening one to fit the budget would describe a different source.
+The source-to-bundle comparison then treated omitted paths as confirmed missing because it read
+only the retained names. Carry inventory truncation through the diff and its evidence: preserve
+positive matches, report the other sources as uncertain, and keep confirmed unmatched sources
+for complete inventories. Test the consumer with a real exhausted budget, not only the flag.
+
+**A recovery manifest repeated expanded source roots.** The source-map inventory budget did not
+cover the recovery tool, which copied every expanded path into its manifest: a 75 KiB map with a
+64 KiB root and 1,200 sources retained about 78 MiB. Apply the inventory budget to recovery paths
+too, stop retaining originals when it is exhausted, and report partial recovery with a typed flag.
+
+**An unread part of a source map looked like absent sources.** An index-map section can point at
+another map (`url`), which the parser never fetches: it kept the section boundary but no count, so
+a source comparison reported a source only that map lists as confirmed missing. Count unread
+external sections on the map and in its inventory, carry the count into the application graph with
+a limitation, and give an otherwise unmatched source an `uncertain` reason. Test an inline section
+beside an external one, a nested index map, and the sources-only read used for bad mappings.
+
+**A fix landed in one of two copies of a reader.** The `sourceMappingURL` rules were fixed in
+`formats::sourcemap`, but `js::find_map_url` kept requiring a literal space, so a bundle with the
+standard no-space annotation was analysed without its map. Have one implementation and call it
+from both places; a regression at the consumer's public entry point catches a copy that drifts.
+
+**A floating-point conversion changed a fingerprint.** Widening a single-precision NaN to a double
+can change its sign, payload or signaling bit. Keep the original encoded bits for identities, and
+test signaling/quiet pairs as well as different payloads; retain numeric conversion for display.
+
+**A canonical-length check hid readable signature facts.** Rejecting a redundant ASN.1 length
+made its certificate or signature disappear from the report. Keep a bounded, readable element,
+mark its non-minimal encoding, and carry that limitation into every signature view. Test retained
+metadata and the warning together; encoding conformance and cryptographic verification are separate facts.
+
+**An unknown header bit hid readable code.** Rejecting undefined `.pyc` flag bits made the whole
+file unreadable, dropping its code, names and constants from reports. A reader collecting evidence
+must preserve fields and payload it can still understand: report the unknown bits as a warning,
+derive known modes from their defined bits, and test that the warning and recovered data coexist.
 
 **A round of checks that nothing could stop.** The builder's own checks ran one after another on
 the build's thread with no time limit, Pause was looked at only between tool calls, and the feed
@@ -534,6 +601,34 @@ resolved zero-argument calls, then filtered for known wrappers; ordinary local c
 the buffer before a real dependency appeared. Discover wrapper bindings first and count only
 recognised dependencies against their limit. Keep the buffer bounded, and test unrelated calls,
 forward declarations and more actual dependencies than the limit permits.
+
+**A capped window's counts read as totals.** A source-to-bundle comparison stopped examining after
+`max_rows` scripts but put its matched/unmatched counts beside the total script count, and reported
+the truncated unclaimed rows as the number of unclaimed units. Report how many were examined, count
+totals separately from listed rows, and mark the cap in the result and the tool's limitation.
+
+**A row cap kept the counts but lost the rows silently.** An archive comparison counted every
+added, removed, changed and moved file, then listed only `max_rows` of each with no flag, so a
+reader took the lists for complete. Set `rows_capped` beside the counts and report partial
+coverage with a limitation, as the managed comparison already does.
+
+**A report showed a prefix of its limitations as the whole list.** `core_report_write` rendered
+only the first 30 distinct limitations in Markdown and HTML with no marker for the rest, so a
+reader could mistake a capped list for everything the evidence said. Keep the display cap for
+readability but name how many were omitted in both formats; test one more limitation than the cap.
+
+**A comparison list was taken for the whole set.** The application comparison cut added, removed,
+bundle-module and vendor rows at 2,000, and its summary counted those cut lists as totals; the
+export comparison cut each module's added/removed diff the same way. Keep a complete total beside
+every capped list, aggregate `rows_capped` for the result, including nested function/export diffs of
+changed modules, use the totals in summaries, and report partial coverage. Test more rows than the
+cap on every capped path, not only the first one.
+
+**A list cap stopped at one parsing path.** The syntax-tree pass bounded `endpoints` and `exposed`,
+but the lexer fallback, used for huge, deeply nested or unparsable sources, pushed to both without
+a limit, so the path chosen for hostile input was the one that could grow. Apply the same cap to
+every push on every path, record the list in `truncated` where the parsed path does, and test the
+fallback with more calls than the cap permits.
 
 **An occurrence label was also a binding name.** The second `obj.x` window and the first
 `obj["x[2]"]` window both appeared as `obj.x[2]`. Reserve literal labels and use a separate
@@ -697,12 +792,43 @@ must never stand in for data that gets saved back: wait (it's startup), or keep 
 The model picker later captured a busy session as "no project", queried in the wrong directory,
 and rejected the save as a settings change. Capture settings and project under one guard; report
 contention, preserve the draft and matching background results, and check again when available.
+It happened again in the loader itself: `Settings::load_from` took every read error for "no file",
+so a config.toml that wasn't UTF-8, or that another program held for a moment, loaded as defaults
+and the next save replaced it; a file that couldn't be parsed was renamed aside with the rename's
+result ignored. Only "not found" means there's nothing to lose. Defaults that stand in for a file
+that is there carry that fact (`Settings::not_loaded`) and refuse to be saved, also through a
+serde round trip that would drop it (`with_setting`); a backup keeps every byte under a name
+nothing else has, and one that fails stops the save.
 
 **A save that changed memory first.** Adding an AI in the app put it in the session's settings,
 then the file write failed (on Windows, likely a virus scan holding config.toml), so the app showed
 the AI and its role while nothing was saved, and the error sat in the message bar behind the Settings
 window. Save to disk first and change memory only after it worked; replace files with a short retry
 on Windows (`write_atomic`); show errors where the person is looking.
+
+**A limit on what is kept, taken for a limit on the work.** `walk_dir` stopped keeping files at
+`max_files` but went on through the whole tree, read each folder's entries into one list before
+looking at any limit, and kept every folder and link it met: a tree of empty folders or links, or
+one folder with millions of names, had no limit at all. Count what is examined, not only what is
+kept; stop at the first thing over a limit; bound what is held while collecting (the first names in
+order, so a cut result is the same every time); and test the shapes that never reach the limit on
+the thing counted (no files, only links, one huge folder).
+
+**An ignore file was read whole.** `walk_dir` read each `.gitignore` with `read_to_string` and
+swallowed every error: a sparse oversized file could size the allocation until the process aborted,
+a FIFO at that path could block the walk, and an unreadable or non-UTF-8 file lost its rules with no
+limitation. Read it through the capped, regular-file-checked helper, keep the cap well above real
+ignore files, and name every skipped file in the evidence; an absent file is the only silent case.
+
+**A graph cap was silent for edges and complete in coverage.** The application graph dropped
+edges past `4 × max_nodes` with no counter, and `js_app_map` reported Complete even when nodes or
+edges had been cut. Count every unique dropped edge, name the cap in a limitation, and make
+coverage partial for either cap. Test a dense graph and a node-capped one.
+
+**A fact list was cut and the graph looked complete.** `js_app` resolved only the first 2,000
+imports per module and discarded `ModuleFacts.truncated`, so later dependencies lost their edge and
+role with no limitation. Resolve every retained import, aggregate per-file truncation into one
+named limitation, and make the map partial; test both the old 2,000 boundary and the facts limit.
 
 **Showing settings shows their secrets.** `settings_show` returned the whole settings, plugins'
 `env` values included, which can hold API keys; a tool's output reaches the journal and MCP
@@ -726,6 +852,19 @@ and run `cargo xtask secrets` before every commit (the `.githooks/pre-commit` ho
 run, while the round numbers carried over, so "Try again" bought six more checks each press and a build that never
 worked reached check 40 and 49 (#736). A limit that must hold across runs is a count saved with the project, and
 it's reset only by a new request. Test it with several runs in a row, not one.
+
+**A cap meant for a default, applied to what the person set.** The 150k limit that keeps a paid
+service's Auto budget cheap was applied to the window read from the server before the person's
+own budget was compared with it, so a 390k budget on a service with a 1M window became 150k
+(found in review of #1155). Apply a default's limit only on the path where no value was set, and
+test a set value above that limit.
+
+**A question that started what it asked about.** The window probe skipped llama-swap's upstream
+route for an unloaded model, but went on to llama.cpp's `/props?model=…` on the same server, and
+llama-swap starts a model for that too: asking about a model with no window in the list unloaded
+the one in use and loaded the other (seen live; the test had only checked that the upstream route
+wasn't asked). Once a server is known to start models on request, ask it nothing but its list
+about one that isn't loaded, and test the whole list of URLs asked, not one of them.
 
 **One field, two meanings.** `TurnDone`'s `input_tokens` included cached tokens from every coding agent but not
 from the built-in loop, which keeps them apart as Anthropic reports them. Once Ollama 0.40 reported its cache, a
@@ -1007,3 +1146,11 @@ an archive parser, but the installer wrote earlier listed files and returned suc
 partial inventory for inspection, expose the stop as typed data, and make extraction check it before
 writing any member. Missing end markers need their own compatibility control; `complete: false`
 alone does not identify a refused metadata record.
+
+**Safe recovery paths erased distinct source identities.** Source-map names such as `src//main.js`
+and `src/main.js` became the same safe path, so exclusive creation kept the first file and dropped
+the second. A file can also occupy a later source's parent directory, or arrive after its own
+child. Preserve ordinary output paths and put collisions in an independent input/source-index
+directory; keep complete source identities in the manifest. Check both prefix orders and
+same-named input scripts through the real recovery tool, and retain the writer's symlink and
+exclusive-creation checks after selecting a name.

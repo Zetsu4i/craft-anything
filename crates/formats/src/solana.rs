@@ -368,6 +368,9 @@ pub fn inspect(data: &[u8]) -> Result<SolanaProgram, FormatError> {
         if s.sh_type != 2 && s.sh_type != 11 {
             continue;
         }
+        if symbols.len() >= MAX_SYMBOLS {
+            break;
+        }
         let dynamic = s.sh_type == 11;
         let strtab = raw_sections.get(s.sh_link as usize).filter(|st| st.sh_type == 3).and_then(|st| str_table(data, st.sh_offset, st.sh_size));
         let Ok(entsize) = usize::try_from(s.sh_entsize) else {
@@ -420,6 +423,9 @@ pub fn inspect(data: &[u8]) -> Result<SolanaProgram, FormatError> {
         let is_rel = s.sh_type == 9;
         if !is_rela && !is_rel {
             continue;
+        }
+        if relocations.len() >= MAX_RELOCS {
+            break;
         }
         let symtab = raw_sections.get(s.sh_link as usize).filter(|st| matches!(st.sh_type, 2 | 11));
         let strtab =

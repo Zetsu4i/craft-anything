@@ -261,7 +261,7 @@ const INSTALL: &str = "Install Frida (for example `pipx install frida-tools`), o
 
 fn cli_failed(what: &str, out: &Output) -> ToolError {
     let tail = {
-        let s = out.stderr_text();
+        let s = out.stderr_end_text();
         let n = s.chars().count();
         s.chars().skip(n.saturating_sub(1500)).collect::<String>()
     };

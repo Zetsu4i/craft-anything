@@ -46,15 +46,7 @@ pub fn load_path(p: &str, max: u64) -> Result<Input, ToolError> {
     if !pb.is_absolute() {
         return Err(ToolError::invalid(format!("{p:?} is not an absolute path")).with_remediation("Pass the full path, for example /home/me/app.apk."));
     }
-    let meta = std::fs::metadata(&pb).map_err(|e| ToolError::io(p, e))?;
-    if meta.is_dir() {
-        return Err(ToolError::invalid(format!("{p} is a folder; pass a file")));
-    }
-    if meta.len() > max {
-        return Err(ToolError::new(ErrorCode::OverLimit, format!("{p} is {} bytes; the limit is {max}", meta.len()))
-            .with_remediation("Raise the size limit parameter if the tool has one, or pass a smaller file."));
-    }
-    let bytes = std::fs::read(&pb).map_err(|e| ToolError::io(p, e))?;
+    let bytes = craft_anything_platform::fs::read_file_capped(&pb, max)?;
     let name = pb.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.to_string());
     let t = Target::from_bytes(pb.clone(), name.clone(), bytes);
     Ok(Input { subject: t.subject(), bytes: t.bytes.clone(), path: pb, name, kind: t.kind })
@@ -65,7 +57,7 @@ pub fn load_path(p: &str, max: u64) -> Result<Input, ToolError> {
 #[derive(Debug, Clone)]
 pub struct PrefixInput {
     pub bytes: Vec<u8>,
-    /// The file's real size.
+    /// Size reported by the opened file's metadata; virtual files may report zero.
     pub file_size: u64,
     /// `bytes` is the whole file.
     pub whole: bool,
@@ -97,14 +89,17 @@ pub fn load_prefix(ctx: &Ctx<'_>, path: Option<&str>, max: u64) -> Result<Prefix
     if !pb.is_absolute() {
         return Err(ToolError::invalid(format!("{p:?} is not an absolute path")).with_remediation("Pass the full path, for example /home/me/model.gguf."));
     }
-    let meta = std::fs::metadata(&pb).map_err(|e| ToolError::io(p, e))?;
-    if meta.is_dir() {
-        return Err(ToolError::invalid(format!("{p} is a folder; pass a file")));
-    }
-    let file = std::fs::File::open(&pb).map_err(|e| ToolError::io(p, e))?;
+    let (mut file, meta) = craft_anything_platform::fs::open_regular_file(&pb)?;
     let mut bytes = Vec::with_capacity(usize::try_from(meta.len().min(max)).unwrap_or(0));
-    file.take(max).read_to_end(&mut bytes).map_err(|e| ToolError::io(p, e))?;
-    let whole = bytes.len() as u64 >= meta.len();
+    (&mut file).take(max).read_to_end(&mut bytes).map_err(|e| ToolError::io(p, e))?;
+    // Metadata can be stale or report zero for readable virtual files. Only EOF proves this
+    // prefix is the whole input and can carry the file's content hash.
+    let mut extra = [0u8; 1];
+    let whole = match file.read_exact(&mut extra) {
+        Ok(()) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => true,
+        Err(error) => return Err(ToolError::io(p, error)),
+    };
     let name = pb.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.to_string());
     let sha256 = whole.then(|| craft_anything_evidence::sha256_hex(&bytes));
     let subject = Subject { kind: "file".into(), sha256, name: Some(name.clone()) };

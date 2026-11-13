@@ -308,6 +308,7 @@ fn ago(d: Duration) -> String {
         0..60 => "just now".into(),
         60..3600 => format!("{} min ago", s / 60),
         3600..86_400 => format!("{} h ago", s / 3600),
+        86_400..172_800 => "yesterday".into(),
         _ => format!("{} days ago", s / 86_400),
     }
 }
@@ -315,6 +316,16 @@ fn ago(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file changed between 24 and 48 hours ago was listed as "1 days ago".
+    #[test]
+    fn recent_file_age_says_yesterday_for_the_second_day() {
+        assert_eq!(ago(Duration::from_secs(86_399)), "23 h ago");
+        assert_eq!(ago(Duration::from_secs(86_400)), "yesterday");
+        assert_eq!(ago(Duration::from_secs(86_405)), "yesterday");
+        assert_eq!(ago(Duration::from_secs(172_799)), "yesterday");
+        assert_eq!(ago(Duration::from_secs(172_800)), "2 days ago");
+    }
 
     /// A copy of the builder's session has no tool server, and saw the build's tools as gone.
     #[test]

@@ -427,12 +427,112 @@ impl Binary {
     }
 }
 
-/// Demangle Rust (legacy and v0) names; other names are left alone.
+/// Demangle Rust (legacy and v0) names; other names are left alone. The result leaves out the
+/// hashes the compiler adds (a legacy name's `h<hash>`, a v0 crate's `s<hash>_`), so the same
+/// path built by another toolchain demangles to the same text.
 pub fn demangle(name: &str) -> Option<String> {
     let trimmed = name.strip_prefix('_').filter(|n| n.starts_with("_ZN") || n.starts_with("_R")).unwrap_or(name);
     let d = rustc_demangle::try_demangle(trimmed).ok()?;
     let s = format!("{d:#}");
     if s == name { None } else { Some(s) }
+}
+
+/// A Rust name as two builds of it can be compared: demangled without the compiler's hashes and,
+/// for a v0 name of a generic instance, followed by ` @<crate>`, the crate that instantiated it
+/// (demangling drops that crate, and every crate has its own copy of `<&str as Debug>::fmt`).
+/// `None` for names that aren't Rust.
+pub fn rust_name_without_hash(name: &str) -> Option<String> {
+    let plain = demangle(name)?;
+    match v0_instantiating_crate(name) {
+        Some(krate) => Some(format!("{plain} @{krate}")),
+        None => Some(plain),
+    }
+}
+
+/// How far back from the end of a v0 name its instantiating crate is looked for.
+const TRAILING_CRATE_BYTES: usize = 256;
+
+/// The instantiating crate's name at the end of a v0 name: a crate root (`C`, an optional
+/// `s<hash>_`, an identifier) or a back-reference to one.
+fn v0_instantiating_crate(name: &str) -> Option<&str> {
+    // Mach-O adds its own `_` in front of `_R`.
+    let body = name.strip_prefix("__R").or_else(|| name.strip_prefix("_R"))?;
+    // A suffix such as `.llvm.123` isn't part of the name.
+    let body = body.split('.').next()?;
+    let b = body.as_bytes();
+    // `B` is a base-62 digit too, so try each `B` in the tail and keep one that reaches a crate.
+    if let Some((b'_', rest)) = b.split_last() {
+        // A back-reference into a name of any realistic length has a few digits; reading more
+        // would only make a long hostile name slow.
+        let run = rest.iter().rev().take(12).take_while(|c| c.is_ascii_alphanumeric()).count();
+        for at in (rest.len().saturating_sub(run)..rest.len()).rev() {
+            if b.get(at) == Some(&b'B')
+                && let Some(target) = backref_target(rest.get(at + 1..)?, at)
+                && let Some((krate, _)) = crate_root(b, target)
+            {
+                return Some(krate);
+            }
+        }
+    }
+    // A crate root at the end is short; looking further back would make each `C` of a long
+    // hostile name another full read.
+    let tail = b.len().saturating_sub(TRAILING_CRATE_BYTES);
+    for (i, _) in body.char_indices().rev().take_while(|(i, _)| *i >= tail).filter(|(_, c)| *c == 'C') {
+        if let Some((krate, end)) = crate_root(b, i)
+            && end == b.len()
+        {
+            return Some(krate);
+        }
+    }
+    None
+}
+
+/// Where a back-reference with these base-62 digits points, if before `at`.
+fn backref_target(digits: &[u8], at: usize) -> Option<usize> {
+    let mut v: u64 = 0;
+    for c in digits {
+        let d = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'z' => c - b'a' + 10,
+            b'A'..=b'Z' => c - b'A' + 36,
+            _ => return None,
+        };
+        v = v.checked_mul(62)?.checked_add(u64::from(d))?;
+    }
+    let target = if digits.is_empty() { 0 } else { v.checked_add(1)? };
+    let target = usize::try_from(target).ok()?;
+    (target < at).then_some(target)
+}
+
+/// A crate root at `at`: its identifier and where it ends.
+fn crate_root(b: &[u8], at: usize) -> Option<(&str, usize)> {
+    let mut i = at;
+    if b.get(i) != Some(&b'C') {
+        return None;
+    }
+    i += 1;
+    if b.get(i) == Some(&b's') {
+        i += 1;
+        while b.get(i)?.is_ascii_alphanumeric() {
+            i += 1;
+        }
+        if b.get(i) != Some(&b'_') {
+            return None;
+        }
+        i += 1;
+    }
+    let digits = b.get(i..)?.iter().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 || b.get(i) == Some(&b'0') {
+        return None;
+    }
+    let len: usize = std::str::from_utf8(b.get(i..i + digits)?).ok()?.parse().ok()?;
+    i += digits;
+    if b.get(i) == Some(&b'_') {
+        i += 1;
+    }
+    let end = i.checked_add(len)?;
+    let ident = std::str::from_utf8(b.get(i..end)?).ok()?;
+    Some((ident, end))
 }
 
 /// Parse any supported container. Universal Mach-O files are parsed at their preferred slice
@@ -851,6 +951,52 @@ mod tests {
     fn demangles_rust_names() {
         assert_eq!(demangle("_ZN4core9panicking5panic17h0123456789abcdefE").as_deref(), Some("core::panicking::panic"));
         assert_eq!(demangle("main"), None);
+    }
+
+    #[test]
+    fn demangled_rust_names_leave_the_crate_hash_out() {
+        // The same v0 path from two toolchains: only the crate hash differs.
+        let old = demangle("_RNvNtCs3XW7gbOxCtj_5alloc3vec9from_elem");
+        let new = demangle("__RNvNtCsk1nqp0aJv2u_5alloc3vec9from_elem");
+        assert_eq!(old.as_deref(), Some("alloc::vec::from_elem"));
+        assert_eq!(old, new);
+        assert_eq!(demangle("_ZN4core9panicking5panic17hffffffffffffffffE").as_deref(), Some("core::panicking::panic"));
+    }
+
+    #[test]
+    fn rust_names_keep_the_crate_that_instantiated_them() {
+        // From two `cargo` builds: one impl, instantiated by two crates, under two toolchains.
+        let fmt = |core: &str, krate: &str| format!("__RNvXs1g_NtCs{core}_4core3fmtRRShNtB6_5Debug3fmt{krate}");
+        let a_old = rust_name_without_hash(&fmt("aTNopw4qKPP", "Csf2bNCj6Gxye_8rusqlite"));
+        let a_new = rust_name_without_hash(&fmt("jIpoRzUjyHQ", "CscXxSlMAnKE_8rusqlite"));
+        let b_new = rust_name_without_hash(&fmt("jIpoRzUjyHQ", "Cs1SSuMAdGM58_3std"));
+        assert_eq!(a_old, a_new);
+        assert!(a_old.as_deref().is_some_and(|n| n.ends_with(" @rusqlite")), "{a_old:?}");
+        assert!(b_new.as_deref().is_some_and(|n| n.ends_with(" @std")), "{b_new:?}");
+        // A back-reference to a crate named earlier in the name, and a suffix after it.
+        let back = rust_name_without_hash("_RINvNtCs1234_4core3ptr9drop_glueNtCs99_5cargo6ConfigEBw_.llvm.42");
+        assert!(back.as_deref().is_some_and(|n| n.ends_with(" @cargo")), "{back:?}");
+        // No instantiating crate, a name that isn't Rust, and malformed tails: no panic, no crate.
+        assert_eq!(rust_name_without_hash("_RNvNtCs3XW7gbOxCtj_5alloc3vec9from_elem").as_deref(), Some("alloc::vec::from_elem"));
+        assert_eq!(rust_name_without_hash("main"), None);
+        for bad in ["_RC", "_RB_", "_RBzzzzzzzzzzzzzzzzzz_", "_RCs_", "_RC99x", "__RNvC3foo3barB"] {
+            let _ = rust_name_without_hash(bad);
+        }
+        // A long hostile tail of crate-root starts is read only near its end.
+        // Each `C<n>` claims an identifier that ends one byte short of the name, so every one is
+        // read to nearly the end before it's refused.
+        let mut pieces = vec![String::from("xx")];
+        let mut len = 2;
+        for _ in 0..200_000 {
+            let piece = format!("C{}", len - 1);
+            len += piece.len();
+            pieces.push(piece);
+        }
+        pieces.reverse();
+        let long = format!("_R{}", pieces.concat());
+        let started = std::time::Instant::now();
+        assert_eq!(v0_instantiating_crate(&long), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
     }
 
     #[test]

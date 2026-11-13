@@ -1,11 +1,54 @@
-//! File safety: atomic writes (temp file, fsync, rename), optionally private (0600 on Unix).
+//! File safety: bounded regular-file reads and atomic writes (temp file, fsync, rename),
+//! optionally private (0600 on Unix).
 
-use craft_anything_evidence::ToolError;
-use std::io::Write as _;
+use craft_anything_evidence::{ErrorCode, ToolError};
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Open a regular file and return metadata from the opened handle. Symlinks to regular files
+/// are allowed. On Unix, a path replaced by a FIFO cannot block the open before its type is checked.
+pub fn open_regular_file(path: &Path) -> Result<(std::fs::File, std::fs::Metadata), ToolError> {
+    let invalid = || ToolError::invalid(format!("{} is not a regular file", path.display()));
+    let before = std::fs::metadata(path).map_err(|e| ToolError::io(path.display(), e))?;
+    if !before.is_file() {
+        return Err(invalid());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|e| ToolError::io(path.display(), e))?;
+    let metadata = file.metadata().map_err(|e| ToolError::io(path.display(), e))?;
+    if !metadata.is_file() {
+        return Err(invalid());
+    }
+    Ok((file, metadata))
+}
+
+/// Read a whole regular file, enforcing `max` on the bytes read as well as the size metadata.
+/// The one-byte overflow probe does not add to `max`, so even `u64::MAX` cannot overflow.
+pub fn read_file_capped(path: &Path, max: u64) -> Result<Vec<u8>, ToolError> {
+    let (mut file, metadata) = open_regular_file(path)?;
+    if metadata.len() > max {
+        return Err(ToolError::new(ErrorCode::OverLimit, format!("{} is {} bytes; the limit is {max}", path.display(), metadata.len()))
+            .with_remediation("Raise the size limit parameter if you really want to read it."));
+    }
+    let mut bytes = Vec::new();
+    (&mut file).take(max).read_to_end(&mut bytes).map_err(|e| ToolError::io(path.display(), e))?;
+    let mut extra = [0u8; 1];
+    match file.read_exact(&mut extra) {
+        Ok(()) => Err(ToolError::new(ErrorCode::OverLimit, format!("{} contains more than {max} bytes; the read limit was reached", path.display()))
+            .with_remediation("Raise the size limit parameter if you really want to read it.")),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(bytes),
+        Err(error) => Err(ToolError::io(path.display(), error)),
+    }
+}
 
 /// Write `bytes` to `path` atomically, keeping the existing file's permissions when it exists.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {

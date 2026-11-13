@@ -1467,3 +1467,24 @@ Connecting to {name}… {seconds} s	{name} sunucusuna bağlanılıyor… {second
 Stopped adding {name}.	{name} eklenmesi durduruldu.
 It isn't there any more, so {program} runs in its place.	Artık orada değil, bu yüzden yerine {program} çalışıyor.
 Use it	Bunu kullan
+
+# Native update checks and verified installation.
+ArtCraft Launcher manages this app's version. Change its version there.	Bu uygulamanın sürümünü ArtCraft Launcher yönetiyor. Sürümü oradan değiştirin.
+Check again	Yeniden denetle
+Check for Updates	Güncellemeleri denetle
+Check for Updates…	Güncellemeleri denetle…
+Checking for updates…	Güncellemeler denetleniyor…
+Couldn't check for updates: {error}	Güncellemeler denetlenemedi: {error}
+Downloading and verifying the update…	Güncelleme indiriliyor ve doğrulanıyor…
+No installer is available for this platform.	Bu platform için bir yükleyici yok.
+Releases	Sürümler
+Save your work and stop running tasks before installing an update.	Güncelleme yüklemeden önce çalışmanızı kaydedin ve çalışan görevleri durdurun.
+The update failed: {error}	Güncelleme başarısız oldu: {error}
+The update worker stopped unexpectedly. Try checking again.	Güncelleme işlemi beklenmedik şekilde durdu. Yeniden denetlemeyi deneyin.
+This installation is managed externally. Update it with its package manager or open Releases.	Bu kurulum harici olarak yönetiliyor. Paket yöneticisiyle güncelleyin veya Sürümler’i açın.
+Update and restart	Güncelle ve yeniden başlat
+Update ready. Restarting…	Güncelleme hazır. Yeniden başlatılıyor…
+Updated to {version}.	{version} sürümüne güncellendi.
+Use Releases or your package manager to update this installation.	Bu kurulumu güncellemek için Sürümler’i veya paket yöneticinizi kullanın.
+You're up to date.	En güncel sürümdesiniz.
+{version} is available.	{version} sürümü kullanılabilir.

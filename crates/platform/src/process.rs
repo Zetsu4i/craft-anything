@@ -56,6 +56,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_STDOUT_CAP: usize = 16 * 1024 * 1024;
 /// Default stderr cap.
 pub const DEFAULT_STDERR_CAP: usize = 1024 * 1024;
+/// How much of a stream's end is kept once it passes its cap, for a failure's message.
+const TAIL_KEEP: usize = 16 * 1024;
 /// How long to wait for the output threads after the child exits (an escaped grandchild may hold
 /// the pipe open; we stop waiting rather than hang).
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
@@ -102,6 +104,11 @@ pub struct Output {
     pub success: bool,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// The last bytes printed after `stdout` filled, when it was longer; empty otherwise. The
+    /// start stays in `stdout` for the tools that parse it, while errors show this end.
+    pub stdout_tail: Vec<u8>,
+    /// The last bytes printed after `stderr` filled, when it was longer; empty otherwise.
+    pub stderr_tail: Vec<u8>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub duration: Duration,
@@ -114,6 +121,22 @@ impl Output {
 
     pub fn stderr_text(&self) -> String {
         String::from_utf8_lossy(&self.stderr).into_owned()
+    }
+
+    /// The end of stdout: the kept tail when more was printed than the cap, else all of it.
+    pub fn stdout_end_text(&self) -> String {
+        if self.stdout_tail.is_empty() { self.stdout_text() } else { String::from_utf8_lossy(&self.stdout_tail).into_owned() }
+    }
+
+    /// The end of stderr: the kept tail when more was printed than the cap, else all of it.
+    pub fn stderr_end_text(&self) -> String {
+        if self.stderr_tail.is_empty() { self.stderr_text() } else { String::from_utf8_lossy(&self.stderr_tail).into_owned() }
+    }
+
+    /// The end of the program's failure output: stderr, or stdout when stderr is blank.
+    pub fn end_text(&self) -> String {
+        let stderr_blank = self.stderr.iter().all(u8::is_ascii_whitespace) && self.stderr_tail.iter().all(u8::is_ascii_whitespace);
+        if stderr_blank { self.stdout_end_text() } else { self.stderr_end_text() }
     }
 }
 
@@ -516,19 +539,18 @@ fn shell_word(s: &str) -> String {
 pub fn output_excerpt(text: &str) -> String {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let from = lines.len().saturating_sub(SHOWN_OUTPUT_LINES);
-    lines
-        .get(from..)
-        .unwrap_or_default()
-        .iter()
-        .map(|l| {
-            if l.chars().count() > SHOWN_OUTPUT_LINE_CHARS {
-                format!("{}…", l.chars().take(SHOWN_OUTPUT_LINE_CHARS).collect::<String>())
-            } else {
-                l.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    lines.get(from..).unwrap_or_default().iter().copied().map(clip_end).collect::<Vec<_>>().join("\n")
+}
+
+/// A line cut to a readable length at its end: the last part is what a failure says.
+fn clip_end(line: &str) -> String {
+    let n = line.chars().count();
+    if n > SHOWN_OUTPUT_LINE_CHARS {
+        let kept: String = line.chars().skip(n - SHOWN_OUTPUT_LINE_CHARS).collect();
+        format!("…{kept}")
+    } else {
+        line.to_string()
+    }
 }
 
 /// The line of a program's output that says what went wrong: the last one, or, when a crash ends
@@ -540,7 +562,7 @@ fn headline(text: &str) -> String {
         let frames_start = lines.get(..=last).unwrap_or_default().iter().rposition(|l| !is_stack_frame(l))?;
         lines.get(frames_start)
     });
-    above_trace.or(lines.last()).map(|l| l.to_string()).unwrap_or_default()
+    above_trace.or(lines.last()).map(|l| clip_end(l)).unwrap_or_default()
 }
 
 /// A stack frame: `at f (/app/chunk.js:96:6417)`, `at node:internal/main:28:49`,
@@ -551,6 +573,13 @@ fn is_stack_frame(line: &str) -> bool {
     at_line || (line.starts_with("... ") && line.ends_with(" more"))
 }
 
+/// The line that says what went wrong: from the end of a long output when it carries the error,
+/// else from the start (a crash's error sits above its stack trace, which can fill the end).
+fn headline_of(head: &str, end: &str) -> String {
+    let end_line = headline(end);
+    if end_line.is_empty() || is_stack_frame(&end_line) || end_line.starts_with("Node.js v") { headline(head) } else { end_line }
+}
+
 /// The error for a non-zero exit, with the last part of stderr (or stdout) for context.
 pub fn nonzero_error(name: &str, out: &Output) -> ToolError {
     nonzero_error_with(name, out, None)
@@ -559,13 +588,23 @@ pub fn nonzero_error(name: &str, out: &Output) -> ToolError {
 /// [`nonzero_error`], also saying what was run so the person can run it themselves.
 pub fn nonzero_error_with(name: &str, out: &Output, command: Option<&str>) -> ToolError {
     let code = out.code.map(|c| c.to_string()).unwrap_or_else(|| "a signal".into());
-    let stderr_tail = tail(&out.stderr, 2000);
-    let context = if stderr_tail.trim().is_empty() { tail(&out.stdout, 2000) } else { stderr_tail };
-    let first_line = headline(&String::from_utf8_lossy(if out.stderr.iter().all(u8::is_ascii_whitespace) { &out.stdout } else { &out.stderr }));
+    // The head is kept for parsers and a crash's first lines; the tail is how a long run ended.
+    let stderr_blank = out.stderr.iter().all(u8::is_ascii_whitespace) && out.stderr_tail.iter().all(u8::is_ascii_whitespace);
+    let (head, end, truncated) = if stderr_blank {
+        (String::from_utf8_lossy(&out.stdout), out.stdout_end_text(), out.stdout_truncated)
+    } else {
+        (String::from_utf8_lossy(&out.stderr), out.stderr_end_text(), out.stderr_truncated)
+    };
+    let end_shown = if end.trim().is_empty() && !head.trim().is_empty() { head.as_ref() } else { end.as_str() };
+    let context = tail(end_shown.as_bytes(), 2000);
+    let first_line = headline_of(head.as_ref(), &end);
     let msg =
         if first_line.is_empty() { format!("{name} stopped with exit code {code}.") } else { format!("{name} stopped with exit code {code}: {first_line}") };
     let excerpt = output_excerpt(&context);
     let mut said = if excerpt.is_empty() { format!("{name} printed nothing.") } else { format!("What {name} printed last:\n{excerpt}") };
+    if truncated {
+        said.push_str("\n\nThe output was cut; its last part is shown.");
+    }
     if let Some(command) = command {
         said.push_str(&format!("\n\nTo try it yourself, run:\n{command}"));
     }
@@ -675,22 +714,42 @@ impl Drop for RunningProcess {
 
 struct Capped {
     data: Vec<u8>,
+    /// The last bytes after `data` filled, so a failure can show how the program ended.
+    tail: std::collections::VecDeque<u8>,
     cap: usize,
+    tail_cap: usize,
     truncated: bool,
 }
 
 impl Capped {
     fn new(cap: usize) -> Self {
-        Capped { data: Vec::new(), cap, truncated: false }
+        Capped { data: Vec::new(), tail: std::collections::VecDeque::new(), cap, tail_cap: TAIL_KEEP.min(cap), truncated: false }
     }
 
     fn push(&mut self, bytes: &[u8]) {
         let room = self.cap.saturating_sub(self.data.len());
-        if bytes.len() > room {
-            self.truncated = true;
+        if bytes.len() <= room {
+            self.data.extend_from_slice(bytes);
+            return;
         }
-        if let Some(part) = bytes.get(..room.min(bytes.len())) {
+        self.truncated = true;
+        if let Some(part) = bytes.get(..room) {
             self.data.extend_from_slice(part);
+        }
+        let rest = bytes.get(room..).unwrap_or_default();
+        // Keep the last `tail_cap` bytes of everything past the head.
+        if rest.len() >= self.tail_cap {
+            self.tail.clear();
+            let from = rest.len().saturating_sub(self.tail_cap);
+            if let Some(part) = rest.get(from..) {
+                self.tail.extend(part.iter().copied());
+            }
+        } else {
+            let over = self.tail.len().saturating_add(rest.len()).saturating_sub(self.tail_cap);
+            for _ in 0..over.min(self.tail.len()) {
+                self.tail.pop_front();
+            }
+            self.tail.extend(rest.iter().copied());
         }
     }
 }
@@ -784,11 +843,24 @@ impl Supervisor {
         end(self.child.as_mut(), &self.name);
         self.drain();
         let duration = self.start.elapsed();
-        let (stdout, stdout_truncated) = take(&self.out_buf);
-        let (stderr, stderr_truncated) = take(&self.err_buf);
-        let partial = || serde_json::json!({"stdout_tail": tail(&stdout, 2000), "stderr_tail": tail(&stderr, 2000)});
+        let (stdout, stdout_tail, stdout_truncated) = take(&self.out_buf);
+        let (stderr, stderr_tail, stderr_truncated) = take(&self.err_buf);
+        let partial = || {
+            let end = |head: &[u8], end_bytes: &[u8]| if end_bytes.is_empty() { tail(head, 2000) } else { tail(end_bytes, 2000) };
+            serde_json::json!({"stdout_tail": end(&stdout, &stdout_tail), "stderr_tail": end(&stderr, &stderr_tail)})
+        };
         match stop {
-            Stop::Exited(status) => Ok(Output { code: status.code(), success: status.success(), stdout, stderr, stdout_truncated, stderr_truncated, duration }),
+            Stop::Exited(status) => Ok(Output {
+                code: status.code(),
+                success: status.success(),
+                stdout,
+                stderr,
+                stdout_tail,
+                stderr_tail,
+                stdout_truncated,
+                stderr_truncated,
+                duration,
+            }),
             Stop::Wall => Err(ToolError::new(ErrorCode::TimedOut, format!("{} took longer than {} s and was stopped.", self.name, self.wall.as_secs()))
                 .with_remediation("Try a smaller job, or raise the time limit in Settings.")
                 .with_details(serde_json::json!({"deadline": "wall", "timeout_ms": self.wall.as_millis() as u64, "partial": partial()}))),
@@ -880,9 +952,9 @@ fn end(child: &mut dyn ChildWrapper, name: &str) {
     }
 }
 
-fn take(buf: &Arc<Mutex<Capped>>) -> (Vec<u8>, bool) {
+fn take(buf: &Arc<Mutex<Capped>>) -> (Vec<u8>, Vec<u8>, bool) {
     let mut g = buf.lock().unwrap_or_else(PoisonError::into_inner);
-    (std::mem::take(&mut g.data), g.truncated)
+    (std::mem::take(&mut g.data), g.tail.drain(..).collect(), g.truncated)
 }
 
 /// A program started in its own window that is meant to outlive us: a finished game, an
@@ -1162,22 +1234,24 @@ impl Launched {
     }
 
     /// Stop it (the program itself; what it started on its own may stay). Returns once it has
-    /// ended, or false if it couldn't be stopped.
+    /// ended, or false if it couldn't be stopped or is still there [`REAP_GRACE`] later. The
+    /// library's `kill()` waits with no limit (#1438), and waiting under the lock would hold up
+    /// the watcher and everyone asking whether it runs.
     pub fn stop(&self) -> bool {
-        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if st.ended.is_some() {
-            return true;
-        }
-        let Some(child) = st.child.as_mut() else { return false };
-        let _ = child.kill();
-        match child.wait() {
-            Ok(status) => {
-                st.ended = Some(Ended { code: status.code(), after: self.started.elapsed() });
-                st.child = None;
-                true
+        {
+            let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if st.ended.is_some() {
+                return true;
             }
-            Err(_) => false,
+            let Some(child) = st.child.as_mut() else { return false };
+            // A program that just ended refuses the kill: the wait below says how it ended.
+            let _ = child.start_kill();
         }
+        let ended = self.wait_timeout(REAP_GRACE).is_some();
+        if !ended {
+            log::warn!("program {}: still there {} s after it was stopped; not waiting for it", self.pid, REAP_GRACE.as_secs());
+        }
+        ended
     }
 }
 
@@ -1745,11 +1819,37 @@ mod error_tests {
             success: false,
             stdout: Vec::new(),
             stderr: bun.into(),
+            stdout_tail: Vec::new(),
+            stderr_tail: Vec::new(),
             stdout_truncated: false,
             stderr_truncated: false,
             duration: Duration::ZERO,
         };
         assert_eq!(nonzero_error("OpenCode", &out).message, "OpenCode stopped with exit code 1: error: No provider is set up");
+    }
+
+    /// A failure whose last line is longer than the excerpt's line limit shows the line's end,
+    /// where the error is, not its start.
+    #[test]
+    fn a_long_last_line_shows_its_end() {
+        let line = format!("{}REAL-ERROR", "w".repeat(1000));
+        let shown = output_excerpt(&line);
+        assert!(shown.starts_with('…') && shown.contains("REAL-ERROR"), "{shown}");
+        assert_eq!(shown.chars().count(), SHOWN_OUTPUT_LINE_CHARS + 1);
+    }
+
+    /// The failure's text is stderr, or stdout when stderr is blank, and its kept end when the
+    /// stream was longer than its cap.
+    #[test]
+    fn end_text_uses_stderr_or_stdout_and_the_tail() {
+        let stderr = Output { stderr: b"warn\n".to_vec(), ..Default::default() };
+        assert_eq!(stderr.end_text(), "warn\n");
+        let stdout = Output { stdout: b"out\n".to_vec(), ..Default::default() };
+        assert_eq!(stdout.end_text(), "out\n");
+        let tail = Output { stderr: b"head".to_vec(), stderr_tail: b"REAL".to_vec(), ..Default::default() };
+        assert_eq!(tail.end_text(), "REAL");
+        let blank = Output { stderr: b"  ".to_vec(), stderr_tail: b"REAL".to_vec(), ..Default::default() };
+        assert_eq!(blank.end_text(), "REAL", "a blank head doesn't hide the tail");
     }
 
     /// #721: a saved path to a program that an update moved said "isn't installed or isn't on your
@@ -1917,6 +2017,60 @@ mod tests {
         assert!(out.success);
         assert_eq!(out.stdout.len(), 1024);
         assert!(out.stdout_truncated);
+    }
+
+    /// A failed program that prints far more to stderr than the cap keeps its real, last error:
+    /// the message names it and the excerpt shows the end, with the cut said out loud.
+    #[test]
+    fn a_long_failure_keeps_its_last_output() {
+        let out = Process::new("sh").args(["-c", "head -c 4194304 /dev/zero | tr '\\0' w >&2; echo REAL-ERROR >&2; exit 1"]).stderr_cap(4096).run().unwrap();
+        assert!(!out.success && out.stderr_truncated);
+        assert_eq!(out.stderr.len(), 4096);
+        let err = nonzero_error("sh", &out);
+        assert!(err.message.contains("REAL-ERROR"), "the real error is named: {:.200}", err.message);
+        assert!(out.stderr_end_text().contains("REAL-ERROR"), "the end is kept: {}", out.stderr_end_text());
+        let help = err.remediation.unwrap_or_default();
+        assert!(help.contains("REAL-ERROR"), "the excerpt shows the end: {help}");
+        assert!(help.contains("cut"), "the error says the output was cut: {help}");
+    }
+
+    /// The same when the program writes its failure to stdout: the kept end is used.
+    #[test]
+    fn a_long_stdout_failure_keeps_its_last_output() {
+        let out = Process::new("sh").args(["-c", "head -c 4194304 /dev/zero | tr '\\0' w; echo REAL-ERROR; exit 1"]).stdout_cap(4096).run().unwrap();
+        assert!(!out.success && out.stdout_truncated);
+        assert_eq!(out.stdout.len(), 4096);
+        assert!(out.stdout_end_text().contains("REAL-ERROR"), "the end is kept: {}", out.stdout_end_text());
+        let err = nonzero_error("sh", &out);
+        assert!(err.message.contains("REAL-ERROR"), "the real error is named: {:.200}", err.message);
+        assert!(err.remediation.unwrap_or_default().contains("REAL-ERROR"), "the excerpt shows the end");
+    }
+
+    /// A truncated crash still gets its error line from the start: the end is only a stack trace,
+    /// which must not become the headline.
+    #[test]
+    fn a_truncated_crash_is_named_by_its_error_not_its_last_frame() {
+        let mut head = String::from("Error: Not signed in\n");
+        for i in 0..200 {
+            head.push_str(&format!("    at step{i} (/app/cli.js:{i}:1)\n"));
+        }
+        let mut tail = String::new();
+        for i in 200..400 {
+            tail.push_str(&format!("    at step{i} (/app/cli.js:{i}:1)\n"));
+        }
+        tail.push_str("\nNode.js v20.11.0\n");
+        let out = Output {
+            code: Some(1),
+            success: false,
+            stdout: Vec::new(),
+            stderr: head.into_bytes(),
+            stdout_tail: Vec::new(),
+            stderr_tail: tail.into_bytes(),
+            stdout_truncated: false,
+            stderr_truncated: true,
+            duration: Duration::ZERO,
+        };
+        assert!(nonzero_error("OpenCode", &out).message.contains("Not signed in"), "{}", nonzero_error("OpenCode", &out).message);
     }
 
     #[test]

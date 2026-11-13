@@ -132,11 +132,14 @@ fn bad_indirect_children_past_the_file_end_are_not_followed() {
 }
 
 #[test]
-fn a_needed_nonzero_triple_root_is_unrecovered_until_triples_are_supported() {
+fn triple_roots_distinguish_readable_sparse_maps_from_missing_metadata() {
     let nblocks = FIRST_TRIPLE + 1;
-    for block in [11, 15, u32::MAX] {
+    for block in [15, u32::MAX] {
         let mut data = sparse_file(nblocks);
         put(&mut data, FILE_INODE + 96, block);
-        assert_unrecovered(&data, nblocks, "triple-indirect");
+        assert_unrecovered(&data, nblocks, "indirect block");
     }
+    let mut sparse = sparse_file(nblocks);
+    put(&mut sparse, FILE_INODE + 96, 11);
+    assert!(recovered_file(&sparse, nblocks).iter().all(|&byte| byte == 0));
 }

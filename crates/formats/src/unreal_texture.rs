@@ -304,6 +304,8 @@ pub fn layout(pixel_format: &str) -> Option<Layout> {
         "PF_R16F" | "PF_R16F_FILTER" => Layout::RHalf,
         "PF_G16R16F" | "PF_G16R16F_FILTER" => Layout::RgHalf,
         "PF_FloatRGBA" => Layout::RgbaHalf,
+        "PF_A2B10G10R10" => Layout::Rgba1010102,
+        "PF_FloatR11G11B10" => Layout::Rgb111110Float,
         "PF_R32_FLOAT" => Layout::RFloat,
         "PF_G32R32F" => Layout::RgFloat,
         "PF_A32B32G32R32F" => Layout::RgbaFloat,

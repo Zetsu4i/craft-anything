@@ -10,6 +10,7 @@ use crate::FormatError;
 use crate::bytes::Reader;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Most accepted and rejected packet records read from one capture.
@@ -826,6 +827,11 @@ pub fn qtype_name(t: u16) -> String {
         16 => "TXT".into(),
         28 => "AAAA".into(),
         33 => "SRV".into(),
+        35 => "NAPTR".into(),
+        39 => "DNAME".into(),
+        44 => "SSHFP".into(),
+        52 => "TLSA".into(),
+        256 => "URI".into(),
         64 => "SVCB".into(),
         65 => "HTTPS".into(),
         257 => "CAA".into(),
@@ -882,13 +888,121 @@ fn dns_name(msg: &[u8], mut off: usize, allow_compression: bool) -> Option<(Stri
                 if !out.is_empty() {
                     out.push('.');
                 }
-                out.extend(label.iter().map(|&c| if c.is_ascii_graphic() { char::from(c) } else { '?' }));
+                for &c in label {
+                    match c {
+                        b'.' | b'\\' => {
+                            out.push('\\');
+                            out.push(char::from(c));
+                        }
+                        c if c.is_ascii_graphic() => out.push(char::from(c)),
+                        _ => {
+                            let _ = write!(out, "\\{c:03}");
+                        }
+                    }
+                }
                 off += 1 + usize::from(l);
             }
             _ => return None,
         }
     }
     None
+}
+
+/// Decode discovery and authentication records whose domain names prohibit compression.
+fn discovery_answer(kind: u16, rd: &[u8]) -> Option<String> {
+    let r = Reader::new(rd);
+    let text = |b: &[u8]| b.iter().flat_map(|v| std::ascii::escape_default(*v)).map(char::from).collect::<String>();
+    let hex = |b: &[u8]| b.iter().map(|v| format!("{v:02x}")).collect::<String>();
+    match kind {
+        39 => dns_name(rd, 0, false).filter(|(_, after, _)| *after == rd.len()).map(|(name, _, _)| name),
+        44 => {
+            let (&algorithm, next) = rd.split_first()?;
+            let (&hash, digest) = next.split_first()?;
+            if digest.is_empty() || hash == 1 && digest.len() != 20 || hash == 2 && digest.len() != 32 {
+                return None;
+            }
+            Some(format!("{algorithm} {hash} {}", hex(digest)))
+        }
+        52 => {
+            let [usage, selector, matching, cert @ ..] = rd else { return None };
+            if cert.is_empty() || *matching == 1 && cert.len() != 32 || *matching == 2 && cert.len() != 64 {
+                return None;
+            }
+            Some(format!("{usage} {selector} {matching} {}", hex(cert)))
+        }
+        256 => {
+            let target = rd.get(4..).filter(|s| !s.is_empty())?;
+            Some(format!("{} {} \"{}\"", r.u16_be(0)?, r.u16_be(2)?, strip_userinfo(&text(target))))
+        }
+        35 => {
+            let mut pos = 4;
+            let mut value = format!("{} {}", r.u16_be(0)?, r.u16_be(2)?);
+            for _ in 0..3 {
+                let len = usize::from(r.u8(pos)?);
+                value.push_str(&format!(" \"{}\"", text(r.slice(pos + 1, len)?)));
+                pos += 1 + len;
+            }
+            let (replacement, _, _) = dns_name(rd, pos, false).filter(|(_, after, _)| *after == rd.len())?;
+            Some(format!("{value} {replacement}"))
+        }
+        64 | 65 => {
+            let priority = r.u16_be(0)?;
+            let (target, mut pos, _) = dns_name(rd, 2, false)?;
+            let mut value = format!("{priority} {target}");
+            let mut previous = None;
+            while pos < rd.len() {
+                let key = r.u16_be(pos)?;
+                let len = usize::from(r.u16_be(pos + 2)?);
+                if key == u16::MAX || previous.is_some_and(|old| old >= key) {
+                    return None;
+                }
+                let param = r.slice(pos + 4, len)?;
+                // Keep unknown keys lossless; interpreting them as text can fabricate an endpoint.
+                let field = match key {
+                    1 if priority != 0 => {
+                        let mut remaining = param;
+                        let mut ids = Vec::new();
+                        while let Some((&n, rest)) = remaining.split_first() {
+                            if n == 0 {
+                                return None;
+                            }
+                            let (id, tail) = rest.split_at_checked(usize::from(n))?;
+                            ids.push(text(id).replace(',', "\\,"));
+                            remaining = tail;
+                        }
+                        if ids.is_empty() {
+                            return None;
+                        }
+                        format!("alpn={}", ids.join(","))
+                    }
+                    3 if priority != 0 => format!("port={}", u16::from_be_bytes(param.try_into().ok()?)),
+                    4 if priority != 0 => {
+                        let (addresses, tail) = param.as_chunks::<4>();
+                        if addresses.is_empty() || !tail.is_empty() {
+                            return None;
+                        }
+                        let hints: Vec<_> = addresses.iter().map(|ip| Ipv4Addr::from(*ip).to_string()).collect();
+                        format!("ipv4hint={}", hints.join(","))
+                    }
+                    6 if priority != 0 => {
+                        let (addresses, tail) = param.as_chunks::<16>();
+                        if addresses.is_empty() || !tail.is_empty() {
+                            return None;
+                        }
+                        let hints: Vec<_> = addresses.iter().map(|ip| Ipv6Addr::from(*ip).to_string()).collect();
+                        format!("ipv6hint={}", hints.join(","))
+                    }
+                    _ => format!("key{key}=0x{}", hex(param)),
+                };
+                value.push(' ');
+                value.push_str(&field);
+                previous = Some(key);
+                pos += len + 4;
+            }
+            Some(value)
+        }
+        _ => None,
+    }
 }
 
 /// Decode a bounded set of DNS questions and answer/prerequisite records from one message.
@@ -940,7 +1054,7 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str, mdns_wire_format: bool)
             let record_class = if mdns_wire_format { class & 0x7fff } else { class };
             let empty_prerequisite = rd.is_empty() && opcode == 5 && matches!(class, 254 | 255) && ttl == 0;
             let value = match (rt, rd.len()) {
-                (1 | 28 | 6 | 33 | 257, 0) if empty_prerequisite => String::new(),
+                (1 | 28 | 6 | 33 | 35 | 39 | 44 | 52 | 64 | 65 | 256 | 257, 0) if empty_prerequisite => String::new(),
                 (1 | 28, _) if record_class != 1 => format!("<{} bytes>", rd.len()),
                 (1, 4) => Ipv4Addr::new(
                     rd.first().copied().unwrap_or(0),
@@ -1042,6 +1156,13 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str, mdns_wire_format: bool)
                     }
                     txt
                 }
+                (35 | 39 | 44 | 52 | 64 | 65 | 256, _) if record_class == 1 => {
+                    let Some(value) = discovery_answer(rt, rd) else {
+                        out.incomplete = true;
+                        break;
+                    };
+                    value
+                }
                 (_, n) => format!("<{n} bytes>"),
             };
             if out.incomplete {
@@ -1055,7 +1176,10 @@ fn dns(msg: &[u8], d: &mut Decoded, label: &'static str, mdns_wire_format: bool)
     d.dns = Some(out);
 }
 
-const METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "CONNECT", "TRACE"];
+/// HTTP method names are case-sensitive tokens, including extension methods.
+fn http_method(method: &str) -> bool {
+    !method.is_empty() && method.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
 
 /// Remove `user:password@` from an absolute request target.
 pub fn strip_userinfo(target: &str) -> String {
@@ -1070,19 +1194,28 @@ pub fn strip_userinfo(target: &str) -> String {
 
 fn tcp_app(p: &[u8], d: &mut Decoded) {
     let head = p.get(..p.len().min(16 << 10)).unwrap_or(p);
-    let line_end = head.windows(2).position(|w| w == b"\r\n").unwrap_or(head.len().min(2048));
-    let line = String::from_utf8_lossy(head.get(..line_end.min(2048)).unwrap_or(&[])).into_owned();
-    if let Some(rest) = line.strip_prefix("HTTP/1.") {
-        let status = rest.split(' ').nth(1).and_then(|s| s.parse().ok());
+    let Some(line_end) = head.windows(2).position(|w| w == b"\r\n") else {
+        tls(p, d);
+        return;
+    };
+    let line = String::from_utf8_lossy(head.get(..line_end).unwrap_or(&[]));
+    let version = |v: &str| matches!(v.as_bytes(), [b'H', b'T', b'T', b'P', b'/', b'1', b'.', b'0'..=b'9']);
+    let mut parts = line.splitn(3, ' ');
+    let fields = (parts.next(), parts.next(), parts.next());
+    if let (Some(v), Some(code), reason) = fields
+        && version(v)
+        && matches!(code.as_bytes(), [b'1'..=b'5', b'0'..=b'9', b'0'..=b'9'])
+        && reason.is_none_or(|text| text.bytes().all(|b| b == b'\t' || !b.is_ascii_control()))
+    {
         d.protocols.push("http");
-        d.http =
-            Some(Http { kind: "response", method: None, target: None, status, version: format!("HTTP/1.{}", rest.chars().next().unwrap_or('?')), host: None });
+        d.http = Some(Http { kind: "response", method: None, target: None, status: code.parse().ok(), version: v.to_string(), host: None });
         return;
     }
-    let mut parts = line.splitn(3, ' ');
-    if let (Some(m), Some(t), Some(v)) = (parts.next(), parts.next(), parts.next())
-        && METHODS.contains(&m)
-        && v.starts_with("HTTP/1.")
+    if let (Some(m), Some(t), Some(v)) = fields
+        && http_method(m)
+        && !t.is_empty()
+        && !t.bytes().any(|b| b.is_ascii_control())
+        && version(v)
     {
         let mut remaining = head.get(line_end + 2..).unwrap_or(&[]);
         let mut host = None;

@@ -175,9 +175,85 @@ impl Inbox {
     }
 }
 
+/// The folder in the inbox where tools say what they are waiting on.
+const ACTIVITY: &str = "activity";
+
+/// A line a tool working on a project says while it waits (a Ghidra decompile, #1714), for the
+/// run that shows the project's feed. Our MCP server runs inside the coding agent, so a tool's own
+/// progress reaches only the agent; this file reaches the app. Removed when the wait ends.
+pub struct Activity {
+    file: PathBuf,
+}
+
+impl Activity {
+    pub fn start(inbox: &Path) -> Activity {
+        Activity { file: inbox.join(ACTIVITY).join(format!("{}-{}.txt", std::process::id(), next_counter())) }
+    }
+
+    /// Say `line`, in place of what this wait said before.
+    pub fn say(&self, line: &str) {
+        let written = match self.file.parent() {
+            Some(dir) => {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string()).and_then(|()| write_atomic(&self.file, line.as_bytes()).map_err(|e| e.message))
+            }
+            None => Ok(()),
+        };
+        if let Err(e) = written {
+            log::warn!("Couldn't tell the app {line:?}: {e}");
+        }
+    }
+}
+
+impl Drop for Activity {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.file);
+    }
+}
+
+/// What the tools working on the project are saying now: (which wait, its line), oldest first.
+pub fn activity(inbox: &Path) -> Vec<(String, String)> {
+    let Ok(entries) = std::fs::read_dir(inbox.join(ACTIVITY)) else { return Vec::new() };
+    let mut lines: Vec<(String, String)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.strip_suffix(".txt")?.to_string();
+            let line = std::fs::read_to_string(e.path()).ok()?;
+            Some((name, line.trim().to_string())).filter(|(_, l)| !l.is_empty())
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// Forget what tools said in an earlier run: a tool that was stopped mid-wait left its line.
+pub fn clear_activity(inbox: &Path) {
+    let _ = std::fs::remove_dir_all(inbox.join(ACTIVITY));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_says_what_it_waits_on_until_it_stops() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(activity(d.path()).is_empty(), "no folder, nothing said");
+        let first = Activity::start(d.path());
+        first.say("Ghidra is decompiling this function (1 min so far; it gives up at 15 min)");
+        first.say("Ghidra is decompiling this function (2 min so far; it gives up at 15 min)");
+        let second = Activity::start(d.path());
+        second.say("Waiting for Ghidra to finish decompiling another function (1 min so far)");
+        let now = activity(d.path());
+        assert_eq!(now.len(), 2, "{now:?}");
+        assert!(now.iter().any(|(_, l)| l.starts_with("Ghidra is decompiling this function (2 min")), "the latest line replaces the last");
+        drop(first);
+        let now = activity(d.path());
+        assert_eq!(now.len(), 1);
+        assert!(now[0].1.starts_with("Waiting for Ghidra"));
+        std::mem::forget(second);
+        clear_activity(d.path());
+        assert!(activity(d.path()).is_empty(), "a wait cut off mid-line is forgotten by the next run");
+    }
 
     #[test]
     fn question_round_trip_across_handles() {

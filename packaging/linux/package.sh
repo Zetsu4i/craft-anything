@@ -27,7 +27,7 @@ APP_ID=ai.storyteller.craft-anything
 
 SKIP_BUILD=0
 FORMATS="appimage deb rpm tar"
-while [ $# -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-build) SKIP_BUILD=1; shift ;;
     --formats) FORMATS="$2"; shift 2 ;;
@@ -48,7 +48,7 @@ BASENAME="craft-anything-$VERSION-linux-$ARCH"
 
 echo "==> Craft Anything $VERSION for Linux $ARCH ($FORMATS; ${BINS[*]})"
 
-if [ "$SKIP_BUILD" = 0 ]; then
+if [[ "$SKIP_BUILD" = 0 ]]; then
   (cd "$ROOT" && cargo build --release --locked "${CARGO_PKGS[@]}" ${CROSS_TARGET:+--target "$CROSS_TARGET"})
 fi
 BIN="$CARGO_TARGET_DIR/${CROSS_TARGET:+$CROSS_TARGET/}release"
@@ -95,7 +95,7 @@ if has deb || has rpm; then
   # nfpm expands env vars in fields like `version` and `arch`, but not in `contents[].src`.
   # Without the CLI, drop its `#cli` lines.
   cli_filter='/#cli$/d'
-  [ "$HAS_CLI" = 1 ] && cli_filter='s/ #cli$//'
+  [[ "$HAS_CLI" = 1 ]] && cli_filter='s/ #cli$//'
   sed -e "s|\${STAGE}|$STAGE|g" -e "$cli_filter" "$HERE/nfpm.yaml" >"$WORK/nfpm.yaml"
   for fmt in deb rpm; do
     if has "$fmt"; then (cd "$ROOT" && nfpm package -f "$WORK/nfpm.yaml" -p "$fmt" -t "$DIST/$BASENAME.$fmt"); fi
@@ -133,18 +133,18 @@ if has appimage; then
   # Usage: fetch_pinned <url> <sha256> <file>. Downloads next to <file> and moves it into place;
   # a file already there is checked too, and one that doesn't match is removed.
   fetch_pinned() {
-    if [ ! -f "$3" ]; then
+    if [[ ! -f "$3" ]]; then
       curl --proto '=https' -fsSL -o "$3.download" "$1"
       mv "$3.download" "$3"
     fi
-    if [ "$(sha256 "$3")" != "$2" ]; then
+    if [[ "$(sha256 "$3")" != "$2" ]]; then
       rm -f "$3"
       echo "$1: SHA-256 doesn't match the pinned release" >&2
       exit 2
     fi
   }
   TOOL="${APPIMAGETOOL:-$(command -v appimagetool || true)}"
-  if [ -z "$TOOL" ]; then
+  if [[ -z "$TOOL" ]]; then
     TOOL="$CARGO_TARGET_DIR/appimagetool-$APPIMAGETOOL_VERSION-$ARCH.AppImage"
     fetch_pinned "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-$ARCH.AppImage" "$APPIMAGETOOL_SHA256" "$TOOL"
     chmod 755 "$TOOL"
@@ -170,16 +170,16 @@ if has appimage; then
   # package) appimagetool also writes the .zsync, into its working directory, hence the cd.
   (cd "$DIST" && ARCH="$ARCH" APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" --no-appstream --runtime-file "$RUNTIME" -u "$UPDATE_INFO" "$APPDIR" "$OUT")
   echo "wrote $OUT"
-  if [ -s "$OUT.zsync" ]; then
+  if [[ -s "$OUT.zsync" ]]; then
     echo "wrote $OUT.zsync"
   else
     warn "zsyncmake not found, so $OUT.zsync was not written; AppImage delta updates need it"
   fi
 fi
 
-if [ -z "${CROSS_TARGET:-}" ]; then
+if [[ -z "${CROSS_TARGET:-}" ]]; then
   "$STAGE/usr/bin/$(smoke_bin)" --version
-elif [ -n "${EMULATOR:-}" ]; then
+elif [[ -n "${EMULATOR:-}" ]]; then
   "$EMULATOR" "$STAGE/usr/bin/$(smoke_bin)" --version
 fi
 echo "==> done"

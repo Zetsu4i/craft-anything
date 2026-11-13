@@ -1467,3 +1467,24 @@ Connecting to {name}… {seconds} s	Подключение к {name}… {seconds
 Stopped adding {name}.	Добавление {name} остановлено.
 It isn't there any more, so {program} runs in its place.	Его там больше нет, поэтому вместо него запускается {program}.
 Use it	Использовать
+
+# Native update checks and verified installation.
+ArtCraft Launcher manages this app's version. Change its version there.	Версией этого приложения управляет ArtCraft Launcher. Измените версию в нём.
+Check again	Проверить снова
+Check for Updates	Проверить обновления
+Check for Updates…	Проверить обновления…
+Checking for updates…	Проверка обновлений…
+Couldn't check for updates: {error}	Не удалось проверить обновления: {error}
+Downloading and verifying the update…	Загрузка и проверка обновления…
+No installer is available for this platform.	Для этой платформы нет установщика.
+Releases	Выпуски
+Save your work and stop running tasks before installing an update.	Перед установкой обновления сохраните работу и остановите выполняющиеся задачи.
+The update failed: {error}	Ошибка обновления: {error}
+The update worker stopped unexpectedly. Try checking again.	Процесс обновления неожиданно остановился. Повторите проверку.
+This installation is managed externally. Update it with its package manager or open Releases.	Эта установка управляется извне. Обновите её через менеджер пакетов или откройте выпуски.
+Update and restart	Обновить и перезапустить
+Update ready. Restarting…	Обновление готово. Перезапуск…
+Updated to {version}.	Обновлено до {version}.
+Use Releases or your package manager to update this installation.	Обновите эту установку через выпуски или менеджер пакетов.
+You're up to date.	Установлена последняя версия.
+{version} is available.	Доступна версия {version}.

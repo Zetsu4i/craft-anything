@@ -99,31 +99,24 @@ impl CraftApp {
         // The folder, its records and copies of the pictures are written on a worker (a slow or
         // network drive must not freeze the window); `created` starts the build.
         self.creating = Some(self.jobs.spawn(tr("Create the project"), false, move |_| {
+            let attached = draft.folder.as_deref().is_some_and(rebuild::project::has_project);
             let created = match &draft.folder {
-                Some(folder) if folder.join(craft_anything_engine::workspace::MANIFEST).is_file() => Workspace::open(folder),
+                Some(folder) if attached => Workspace::open(folder),
                 Some(folder) => Workspace::create_at(folder, &name, &request, target, draft.existing),
                 None => Workspace::create(&projects_dir, &name, &request, target),
             };
             let mut ws = created.map_err(|e| e.for_people())?;
-            // A new project starts with the asset budget from Settings and the person's choice of
-            // generated assets.
-            if let Some(b) = engine {
-                ws.manifest.stack = b.stack().to_string();
-            }
-            ws.set_person(|m| {
-                m.asset_budget_usd = budget;
-                m.generate_assets = generate;
-                // Picked on Make: its later changes are built by it too.
-                m.builder = draft.ai;
-            })
-            .map_err(|e| e.for_people())?;
+            // A new project starts with the stack, asset budget and builder from Make; a folder
+            // that already held one keeps what the person set there.
+            rebuild::project::apply_new_project_fields(&mut ws, attached, engine.map(|b| b.stack()), budget, generate, draft.ai.as_deref())
+                .map_err(|e| e.for_people())?;
             let pictures = ws.add_references(&draft.pictures).err().map(|e| e.message);
-            Ok(Done::Created { ws: Box::new(ws), request, backend, pictures })
+            Ok(Done::Created { ws: Box::new(ws), request, backend, pictures, attached })
         }));
     }
 
     /// A project from [`Self::start_make`] was made: its build starts.
-    pub(crate) fn created(&mut self, ws: Workspace, request: String, backend: String, pictures: Option<String>) {
+    pub(crate) fn created(&mut self, ws: Workspace, request: String, backend: String, pictures: Option<String>, attached: bool) {
         if let Some(e) = pictures {
             self.toast(format!("{} {}", tr("Couldn't add the pictures:"), e), true);
         }
@@ -131,13 +124,38 @@ impl CraftApp {
         self.remember_project(&ws.root);
         self.projects.retain(|p| p.root != ws.root);
         self.projects.insert(0, ws.clone());
-        // Make is cleared for the next one, unless the person has started on it meanwhile (a
-        // project that waited for Ghidra).
-        if self.state.make.request.trim() == request {
+        let root = ws.root.clone();
+        let message = rebuild::project::attached_request(attached, &request);
+        // A project already building keeps its live conversation; the request stays in Make for
+        // the person to send later, because a second start can't run beside it.
+        if self.runs.is_running(&root) || self.runs.position(&root).is_some() {
+            self.state.feed = match self.runs.get_mut(&root).filter(|r| r.is_running()) {
+                Some(run) => run.feed_now(),
+                None => feed::load(&ws),
+            };
+            self.start_run(ws, Some(backend), message, None, Vec::new());
+            return;
+        }
+        // An attached project uses the builder it saved; a new one uses the one Make was started with.
+        let backend = if attached {
+            let Some(saved) = self.builder_backend(ws.manifest.builder.as_deref()) else { return self.need_builder(false) };
+            saved
+        } else {
+            backend
+        };
+        if attached {
+            // The project already has a conversation: keep it, and append the request. The run
+            // records the request in the feed when it starts; the app only reads the feed.
+            self.state.feed = feed::load(&ws);
+            self.state.feed.push(FeedItem::User(UserItem::Text(request.clone())));
+        } else {
+            self.state.feed = vec![FeedItem::User(UserItem::Text(request.clone()))];
+        }
+        self.start_run(ws, Some(backend), message.clone(), message, Vec::new());
+        // Keep an edited draft; clear it only once this request is running or queued.
+        if self.state.make.request.trim() == request && (self.runs.is_running(&root) || self.runs.position(&root).is_some()) {
             self.state.make = MakeDraft::default();
         }
-        self.state.feed = vec![FeedItem::User(UserItem::Text(request))];
-        self.start_run(ws, Some(backend), None, None, Vec::new());
     }
 
     fn run_options(&self, backend: Option<String>, message: Option<String>, shown: Option<String>, pictures: Vec<PathBuf>) -> RunOptions {
@@ -887,6 +905,7 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
             .frame(egui::Frame::new().fill(t.canvas).inner_margin(Margin::same(20)))
             .show(ui, |ui| egui::ScrollArea::vertical().show(ui, |ui| side(app, ui, &ws)));
     }
+    let waiting = app.open_run().filter(|r| r.is_running()).map(RebuildRun::waiting).unwrap_or_default();
     egui::CentralPanel::default().frame(egui::Frame::new().fill(t.canvas).inner_margin(chat::PANE_MARGIN)).show(ui, |ui| {
         let width = ui.available_width();
         let max_w = width.min(720.0);
@@ -910,7 +929,7 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
                                 .show(ui, |ui| side(app, ui, &ws));
                             ui.add_space(chat::MESSAGE_GAP);
                         }
-                        feed(app, ui, &ws);
+                        feed(app, ui, &ws, &waiting);
                     });
                 });
             });
@@ -918,7 +937,7 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
         ui.add_space(chat::COMPOSER_GAP);
         let r = ui.horizontal(|ui| {
             ui.add_space(pad);
-            ui.vertical(|ui| composer(app, ui, max_w, &t));
+            ui.vertical(|ui| composer(app, ui, max_w, &t, waiting.last()));
         });
         chat::remember_composer_height(ui, comp_id, comp_h, r.response.rect.height());
     });
@@ -1191,7 +1210,7 @@ fn stat_row(ui: &mut Ui, label: &str, value: &str) -> egui::Response {
     }
 }
 
-fn feed(app: &mut CraftApp, ui: &mut Ui, ws: &Workspace) {
+fn feed(app: &mut CraftApp, ui: &mut Ui, ws: &Workspace, waiting: &[Note]) {
     let t = Tokens::get(ui.ctx());
     let ctx = ui.ctx().clone();
     let mut answers: Vec<(String, Answer, String)> = Vec::new();
@@ -1225,6 +1244,9 @@ fn feed(app: &mut CraftApp, ui: &mut Ui, ws: &Workspace) {
         });
         ui.add_space(10.0);
     }
+    // Waiting notes scroll with the conversation. The live activity comes after them so it
+    // stays visible when the feed follows the latest work.
+    waiting_notes(app, ui, waiting, &t);
     let items = &app.state.feed;
     // With a plan pinned below, it shows the work and the clock; one progress display, not two.
     let pinned = plan(items).is_some();
@@ -1744,7 +1766,38 @@ fn check_card(app: &mut CraftApp, ui: &mut Ui, ctx: &egui::Context, ws: &Workspa
     });
 }
 
-fn composer(app: &mut CraftApp, ui: &mut Ui, width: f32, t: &Tokens) {
+/// Notes waiting for the builder's next step: each can be taken back, or all sent now.
+fn waiting_notes(app: &mut CraftApp, ui: &mut Ui, waiting: &[Note], t: &Tokens) {
+    let mut take_back = None;
+    for (i, note) in waiting.iter().enumerate() {
+        ui.push_id(("waiting-note", note.id), |ui| {
+            chat::user_bubble(ui, &note.shown, false);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icons::button(ui, "x", 22.0, false, "Take back: puts it in the box again").clicked() {
+                    take_back = Some(note.id);
+                }
+                // Said once, under the last note.
+                if i + 1 == waiting.len() {
+                    if widgets::link(ui, "Send now").on_hover_text(tr("Stops the current step and sends your notes straight away.")).clicked() {
+                        app.pause();
+                    }
+                    let line = if waiting.len() == 1 {
+                        tr("Waiting: the builder reads it at its next step. Up arrow to edit.")
+                    } else {
+                        tr("Waiting: the builder reads these at its next step. Up arrow to edit the last.")
+                    };
+                    ui.label(RichText::new(line).color(t.text_dim).size(theme::SMALL));
+                }
+            });
+        });
+        ui.add_space(4.0);
+    }
+    if let Some(id) = take_back {
+        app.unsend(id);
+    }
+}
+
+fn composer(app: &mut CraftApp, ui: &mut Ui, width: f32, t: &Tokens, last_waiting: Option<&Note>) {
     let running = app.running();
     if let Some(steps) = plan(&app.state.feed).filter(|p| running || p.iter().any(|s| s.status != PlanStatus::Done)) {
         let began = app.open_run().filter(|_| running).map(RebuildRun::started);
@@ -1773,36 +1826,6 @@ fn composer(app: &mut CraftApp, ui: &mut Ui, width: f32, t: &Tokens) {
             ui.label(RichText::new(line).color(t.text_dim).size(theme::SMALL));
         });
         ui.add_space(4.0);
-    }
-    // Notes waiting for the builder's next step: each can be taken back, or all sent now.
-    let waiting = app.open_run().filter(|r| r.is_running()).map(RebuildRun::waiting).unwrap_or_default();
-    let mut take_back = None;
-    // As wide as the prompt box below, so they line up with it.
-    ui.allocate_ui(Vec2::new(width, 0.0), |ui| {
-        for (i, note) in waiting.iter().enumerate() {
-            chat::user_bubble(ui, &note.shown, false);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icons::button(ui, "x", 22.0, false, "Take back: puts it in the box again").clicked() {
-                    take_back = Some(note.id);
-                }
-                // Said once, under the last note.
-                if i + 1 == waiting.len() {
-                    if widgets::link(ui, "Send now").on_hover_text(tr("Stops the current step and sends your notes straight away.")).clicked() {
-                        app.pause();
-                    }
-                    let line = if waiting.len() == 1 {
-                        tr("Waiting: the builder reads it at its next step. Up arrow to edit.")
-                    } else {
-                        tr("Waiting: the builder reads these at its next step. Up arrow to edit the last.")
-                    };
-                    ui.label(RichText::new(line).color(t.text_dim).size(theme::SMALL));
-                }
-            });
-            ui.add_space(4.0);
-        }
-    });
-    if let Some(id) = take_back {
-        app.unsend(id);
     }
     // Pause was pressed and the build hasn't stopped yet: the button says so until it does.
     let open_root = app.workspace.as_ref().map(|w| w.root.clone());
@@ -1841,14 +1864,14 @@ fn composer(app: &mut CraftApp, ui: &mut Ui, width: f32, t: &Tokens) {
                 stop_button: running.then_some("Pause"),
                 stopping: pausing,
                 send: true,
-                recall: !waiting.is_empty(),
+                recall: last_waiting.is_some(),
                 history: Some(&history),
                 font_size: theme::BODY,
             },
         );
         // Like the x on a note: the last one waiting comes back into the box to be edited.
         if out.recall
-            && let Some(note) = waiting.last()
+            && let Some(note) = last_waiting
         {
             app.unsend(note.id);
         }
@@ -2533,7 +2556,7 @@ mod tests {
         let ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
         let mut app = crate::demo::app(crate::demo::engine(craft_anything_engine::Mode::Beginner, true));
         assert!(app.projects.is_empty());
-        app.created(ws.clone(), "A notes app".into(), "test-backend".into(), None);
+        app.created(ws.clone(), "A notes app".into(), "test-backend".into(), None, false);
         assert!(!app.projects.is_empty(), "project is added to app.projects immediately");
         assert_eq!(app.projects[0].root, ws.root);
     }
@@ -2548,6 +2571,55 @@ mod tests {
         app.open_workspace(ws.clone());
         assert!(!app.projects.is_empty(), "open project is listed in app.projects");
         assert_eq!(app.projects[0].root, ws.root);
+    }
+
+    /// An attached folder keeps its saved settings, and its typed request starts the run as a
+    /// follow-up instead of being dropped.
+    #[test]
+    fn an_attached_project_starts_with_the_typed_request() {
+        use craft_anything_ai::{AiConfig, BackendConfig, BackendEntry, BackendKind};
+        let d = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+        ws.set_person(|m| {
+            m.builder = Some("Local".into());
+            m.asset_budget_usd = 42.0;
+            m.generate_assets = true;
+        })
+        .unwrap();
+        ws.manifest.stack = "Godot".into();
+        ws.save().unwrap();
+        craft_anything_ai::rebuild::feed::save(&ws.root, &[FeedItem::User(UserItem::Text("earlier message".into()))]).unwrap();
+        let mut app = crate::demo::app(crate::demo::engine(craft_anything_engine::Mode::Beginner, true));
+        let local = BackendConfig {
+            name: "Local".into(),
+            kind: BackendKind::OpenaiCompatible,
+            model: "qwen3:8b".into(),
+            // Nothing listens there: the run only has to start and write its feed.
+            base_url: Some("http://127.0.0.1:0/v1".into()),
+            ssh_host: None,
+            enabled: true,
+        };
+        app.backends = vec![local.clone()];
+        let mut cfg = AiConfig::default();
+        cfg.upsert(BackendEntry { config: local, options: Default::default() });
+        app.hub.save_config(&cfg).unwrap();
+        // "Off" isn't a backend: the attached project must use the builder it saved instead.
+        app.created(ws.clone(), "add a jump".into(), "Off".into(), None, true);
+        assert!(app.state.feed.iter().any(|i| matches!(i, FeedItem::User(u) if u.text() == "earlier message")), "the saved feed is kept: {:?}", app.state.feed);
+        assert!(app.state.feed.iter().any(|i| matches!(i, FeedItem::User(u) if u.text() == "add a jump")), "the new request is appended: {:?}", app.state.feed);
+        let saved_feed = craft_anything_ai::rebuild::feed::load(&ws);
+        assert!(
+            saved_feed.iter().any(|i| matches!(i, FeedItem::User(u) if u.text() == "add a jump")),
+            "the run recorded the request in the feed: {saved_feed:?}"
+        );
+        let feed = app.runs.get_mut(&ws.root).expect("the run started").feed_now();
+        assert!(feed.iter().any(|i| matches!(i, FeedItem::User(u) if u.text() == "add a jump")), "the typed request is the run's follow-up: {feed:?}");
+        let saved = Workspace::open(&ws.root).unwrap().manifest;
+        assert_eq!(saved.builder.as_deref(), Some("Local"), "the saved builder is kept");
+        assert_eq!(saved.asset_budget_usd, 42.0, "the saved budget is kept");
+        assert!(saved.generate_assets, "the saved asset setting is kept");
+        assert_eq!(saved.stack, "Godot", "the saved stack is kept");
+        app.runs.stop_all();
     }
 }
 

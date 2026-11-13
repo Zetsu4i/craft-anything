@@ -19,9 +19,12 @@ fn split_bom(text: &str) -> (&'static str, &str) {
     }
 }
 
-/// Parse to JSON-like data (first document; an empty file is an empty mapping).
+/// Parse one YAML document to JSON-like data. An empty file is an empty mapping.
 pub fn parse(text: &str) -> Result<Value, String> {
     let docs = YamlLoader::load_from_str(split_bom(text).1).map_err(|e| e.to_string())?;
+    if docs.len() > 1 {
+        return Err("the config must contain only one YAML document".into());
+    }
     match docs.into_iter().next() {
         None | Some(Yaml::Null) => Ok(Value::Object(Map::new())),
         Some(y @ Yaml::Hash(_)) => Ok(to_json(&y, 0)),
@@ -300,6 +303,7 @@ pub fn set(text: &str, table: &str, name: &str, value: &Value) -> Result<String,
 
 /// Remove `table.name`. Returns `None` when it was not there.
 pub fn remove(text: &str, table: &str, name: &str) -> Option<String> {
+    parse(text).ok()?;
     let (bom, text) = split_bom(text);
     let (mut out, _) = split(text);
     let lines: Vec<&str> = out.iter().map(|(t, _)| t.as_str()).collect();
@@ -309,6 +313,25 @@ pub fn remove(text: &str, table: &str, name: &str) -> Option<String> {
     let new = format!("{bom}{}", join(&out));
     parse(&new).ok()?;
     Some(new)
+}
+
+#[cfg(test)]
+mod stream_regressions {
+    use super::*;
+    use serde_json::json;
+
+    /// Editing and removal reject a stream whose extra documents would be ignored by the reader.
+    #[test]
+    fn multiple_yaml_documents_are_refused_before_editing() {
+        for text in
+            ["model: first\n---\nmodel: second\n", "---\nmodel: first\n---\n", "mcp_servers:\n  craft-anything:\n    command: old\n---\nmodel: second\n"]
+        {
+            assert!(parse(text).is_err());
+            assert!(set(text, "mcp_servers", "craft-anything", &json!({"command":"c"})).is_err());
+            assert!(remove(text, "mcp_servers", "craft-anything").is_none());
+        }
+        assert_eq!(parse("---\nmodel: first\n...\n").unwrap()["model"], "first");
+    }
 }
 
 #[cfg(test)]

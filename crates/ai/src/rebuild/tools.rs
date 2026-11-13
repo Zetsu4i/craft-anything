@@ -119,9 +119,11 @@ pub fn specs() -> Vec<ToolSpec> {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StartParams {
-    /// What to make (a new project), or the follow-up message (with `project`).
+    /// What to make (a new project), or the follow-up message (with `project`, or a
+    /// `project_folder` that already holds one).
     pub request: String,
     /// For a new project: a web address, an absolute path to an app, game or file, or `-` for none.
+    /// A `project_folder` that already holds one keeps its saved target.
     #[serde(default)]
     pub target: Option<String>,
     /// Continue this project folder instead of starting a new one.
@@ -135,11 +137,13 @@ pub struct StartParams {
     #[serde(default)]
     pub projects_dir: Option<PathBuf>,
     /// Start the new project in this folder itself instead (it's added to the project list). If
-    /// it already has files, `existing` says what they are.
+    /// it already has files, `existing` says what they are; if it already holds a project, its
+    /// saved target, settings and stack are kept and `request` becomes its follow-up.
     #[serde(default)]
     pub project_folder: Option<PathBuf>,
-    /// With `project_folder` that has files: `edit` (they're the app, edited in place) or
-    /// `start_from` (material to start from; the app is built in app/ beside them).
+    /// With `project_folder` that has files and isn't a project yet: `edit` (they're the app,
+    /// edited in place) or `start_from` (material to start from; the app is built in app/ beside
+    /// them).
     #[serde(default)]
     pub existing: Option<craft_anything_engine::workspace::ExistingFiles>,
     /// What to build with: an engine (unity, unreal, godot, rust) or a stack's full name.
@@ -311,6 +315,7 @@ fn rebuild_questions_list(_ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutpu
     Ok(ToolOutput::Value(json!({"count": questions.len(), "questions": questions})))
 }
 
+/// Start a build: a new project, or a follow-up on an existing one, through the run queue.
 fn rebuild_start(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: StartParams = parse_params(params)?;
     let engine = engine(ctx).ok_or_else(|| {
@@ -337,6 +342,20 @@ fn rebuild_start(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
         }
         None if p.resume => return Err(ToolError::invalid("resume is for an existing project.").with_remediation("Pass its folder as `project`.")),
         None => {
+            let attached = p.project_folder.as_deref().is_some_and(project::has_project);
+            if attached {
+                if p.existing.is_some() {
+                    return Err(ToolError::invalid("This folder already holds a project; pass it as `project` to continue it."));
+                }
+                if p.build_with.is_some() {
+                    return Err(ToolError::invalid("build_with is for new projects; a project keeps the stack it was built with."));
+                }
+                if p.generate_assets {
+                    return Err(
+                        ToolError::invalid("generate_assets is for new projects.").with_remediation("Use project_assets_allow for an existing project.")
+                    );
+                }
+            }
             let target = p.target.as_deref().unwrap_or("-");
             let place = match (&p.project_folder, &p.projects_dir) {
                 (Some(_), Some(_)) => return Err(ToolError::invalid("Pass projects_dir or project_folder, not both.")),
@@ -348,7 +367,7 @@ fn rebuild_start(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
             if p.project_folder.is_some() || matches!(place, project::Place::At(..)) {
                 ctx.session.remember_project(&ws.root)?;
             }
-            (ws, None)
+            (ws, project::attached_request(attached, &p.request))
         }
     };
     if !p.pictures.is_empty() {
@@ -590,6 +609,82 @@ mod tests {
         assert!(e.call("rebuild_note", json!({"project": ws.root, "text": "blue"}), ok()).is_err());
         assert!(e.call("rebuild_note_withdraw", json!({"project": ws.root, "id": 1}), ok()).is_err());
         assert!(e.call("rebuild_stop", json!({"project": ws.root}), ok()).is_err());
+    }
+
+    /// An existing project is attached, not treated as new: its saved settings stay,
+    /// new-project-only options are refused, and the request becomes a follow-up.
+    #[test]
+    fn starting_at_a_folder_that_already_holds_a_project_attaches() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::shared(craft_anything_engine::testing::session(), specs());
+        let ok = || CallOptions::new(Caller::Cli).with_consent(Consent::Granted);
+        let mut ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+        ws.set_person(|m| {
+            m.builder = Some("Claude".into());
+            m.asset_budget_usd = 42.0;
+            m.generate_assets = true;
+        })
+        .unwrap();
+        for (p, said) in [
+            (json!({"project_folder": ws.root, "request": "change it", "build_with": "unity"}), "build_with is for new projects"),
+            (json!({"project_folder": ws.root, "request": "change it", "generate_assets": true}), "generate_assets is for new projects"),
+            (json!({"project_folder": ws.root, "request": "change it", "existing": "edit"}), "already holds a project"),
+        ] {
+            let err = e.call("rebuild_start", p, ok()).unwrap_err();
+            assert!(err.message.contains(said), "{err:?}");
+        }
+        let saved = Workspace::open(&ws.root).unwrap().manifest;
+        assert_eq!(saved.builder.as_deref(), Some("Claude"));
+        assert_eq!(saved.asset_budget_usd, 42.0);
+        assert!(saved.generate_assets);
+    }
+
+    /// The success path: an attached folder keeps its manifest settings, and its typed request
+    /// lands in the run's feed as the follow-up.
+    #[test]
+    fn starting_at_an_existing_project_sends_its_request_as_a_follow_up() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = craft_anything_engine::testing::session();
+        let mut ai = crate::AiConfig::default();
+        ai.upsert(crate::BackendEntry {
+            config: crate::BackendConfig {
+                name: "Local".into(),
+                kind: crate::BackendKind::OpenaiCompatible,
+                model: "qwen3:8b".into(),
+                // Nothing listens there: the run only has to start and write its feed.
+                base_url: Some("http://127.0.0.1:0/v1".into()),
+                ssh_host: None,
+                enabled: true,
+            },
+            options: Default::default(),
+        });
+        s.settings.ai = ai.to_table().unwrap();
+        s.settings.save_to(&s.config_dir().join("config.toml")).unwrap();
+        let e = Engine::shared(s, specs());
+        let mut ws = Workspace::create(d.path(), "Notes", "A notes app", TargetRef::None).unwrap();
+        ws.set_person(|m| {
+            m.builder = Some("Claude".into());
+            m.asset_budget_usd = 42.0;
+            m.generate_assets = true;
+        })
+        .unwrap();
+        ws.manifest.stack = "Godot".into();
+        ws.save().unwrap();
+        let ok = || CallOptions::new(Caller::Mcp).with_consent(Consent::Granted);
+        let out =
+            e.call("rebuild_start", json!({"project_folder": ws.root, "request": "add a jump", "rounds": 0, "backend": "Local"}), ok()).unwrap().to_json();
+        assert_eq!(out["result"]["started"].as_bool(), Some(true), "{out}");
+        let saved = Workspace::open(&ws.root).unwrap().manifest;
+        assert_eq!(saved.builder.as_deref(), Some("Claude"), "the saved builder is kept");
+        assert_eq!(saved.asset_budget_usd, 42.0, "the saved budget is kept");
+        assert!(saved.generate_assets, "the saved asset setting is kept");
+        assert_eq!(saved.stack, "Godot", "the saved stack is kept");
+        let feed = craft_anything_engine::feed::load(&ws);
+        assert!(
+            feed.iter().any(|i| matches!(i, craft_anything_engine::feed::FeedItem::User(u) if u.text() == "add a jump")),
+            "the request is the run's follow-up: {feed:?}"
+        );
+        let _ = e.call("rebuild_stop", json!({"project": ws.root}), ok());
     }
 
     #[test]

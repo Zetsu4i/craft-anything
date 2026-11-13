@@ -566,3 +566,20 @@ fn sources_without_api_rows_serialise_as_before() {
     assert!(a.facts.api_operations.is_empty());
     assert!(serde_json::to_value(&a.facts).unwrap().get("api_operations").is_none(), "no new key where there's nothing to say");
 }
+
+/// The lexer fallback caps endpoints and exposed objects like the syntax-tree pass, so a huge or
+/// unparsable bundle can't grow them without limit.
+#[test]
+fn lexer_fallback_caps_endpoints_and_exposed() {
+    let limits = Limits { max_parse_bytes: 1, ..Limits::default() };
+    let mut src = "fetch('x');\n".repeat(crate::facts::MAX_LIST + 10);
+    // Endpoints are already at the cap, so a URL literal no longer adds one.
+    src.push_str(&"('https://x.test/a');\n".repeat(8));
+    src.push_str(&"window.exposeInMainWorld('k');\n".repeat(crate::facts::MAX_LIST * 2));
+    let a = analyze("big.js", &src, &limits);
+    assert_eq!(a.facts.mode, ParseMode::Lexer, "{:?}", a.facts.mode_reason);
+    assert_eq!(a.facts.endpoints.len(), crate::facts::MAX_LIST, "endpoints are capped, literals included");
+    assert!(a.facts.endpoints.iter().all(|e| e.api == "fetch"), "{:?}", a.facts.endpoints.first());
+    assert!(a.facts.truncated.iter().any(|t| t == "endpoints"), "{:?}", a.facts.truncated);
+    assert_eq!(a.facts.exposed.len(), crate::facts::MAX_LIST);
+}

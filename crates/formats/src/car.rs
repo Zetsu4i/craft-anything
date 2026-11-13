@@ -70,6 +70,8 @@ pub struct AssetCatalog {
     pub facets: Vec<Facet>,
     pub appearances: Vec<(String, u32)>,
     pub renditions: Vec<Rendition>,
+    /// A declared tree could not be read completely; retained entries are a partial inventory.
+    pub tree_incomplete: bool,
     pub warnings: Vec<String>,
 }
 
@@ -180,69 +182,110 @@ impl Bom {
 
     /// Entries (key bytes, value bytes) of a BOM B-tree, in order.
     pub fn tree<'a>(&self, data: &'a [u8], name: &str, warnings: &mut Vec<String>) -> Vec<(&'a [u8], &'a [u8])> {
+        self.tree_entries(data, name, warnings, &mut false)
+    }
+
+    fn tree_entries<'a>(&self, data: &'a [u8], name: &str, warnings: &mut Vec<String>, incomplete: &mut bool) -> Vec<(&'a [u8], &'a [u8])> {
         let mut out = Vec::new();
-        let Some(t) = self.var(data, name) else { return out };
+        let Some((_, id)) = self.vars.iter().find(|(n, _)| n == name) else { return out };
+        let Some(t) = self.block(data, *id) else {
+            tree_problem(warnings, incomplete, format_args!("{name}: missing tree block {id}"));
+            return out;
+        };
         let r = Reader::new(t);
         if t.get(..4) != Some(b"tree") {
             warnings.push(format!("{name} is not a tree"));
             return out;
         }
-        let Some(mut node_id) = r.u32_be(8) else { return out };
+        let Some(mut node_id) = r.u32_be(8) else {
+            tree_problem(warnings, incomplete, format_args!("{name}: tree header cut short"));
+            return out;
+        };
+        if node_id == 0 {
+            return out; // A null root is an empty tree, not a missing child.
+        }
         let mut seen = HashSet::new();
         // Descend to the leftmost leaf.
         loop {
             if !seen.insert(node_id) || seen.len() > MAX_TREE_NODES {
-                warnings.push(format!("{name}: tree loops"));
+                tree_problem(warnings, incomplete, format_args!("{name}: tree loops or exceeds the node limit"));
                 return out;
             }
             let Some(n) = self.block(data, node_id) else {
-                warnings.push(format!("{name}: missing tree node {node_id}"));
+                tree_problem(warnings, incomplete, format_args!("{name}: missing tree node {node_id}"));
                 return out;
             };
-            let nr = Reader::new(n);
-            if nr.u16_be(0) == Some(0) {
-                match nr.u32_be(12) {
-                    Some(child) => node_id = child,
-                    None => return out,
-                }
-            } else {
+            let Some((leaf, count, _)) = node_header(n) else {
+                tree_problem(warnings, incomplete, format_args!("{name}: node {node_id} header cut short"));
+                return out;
+            };
+            if leaf {
                 break;
             }
+            if count == 0 {
+                return out;
+            }
+            let Some(child) = Reader::new(n).u32_be(12).filter(|child| *child != 0) else {
+                tree_problem(warnings, incomplete, format_args!("{name}: node {node_id} has no readable child"));
+                return out;
+            };
+            node_id = child;
         }
         // Walk leaves through their forward links.
         let mut leaves = HashSet::new();
         while node_id != 0 {
             if !leaves.insert(node_id) || leaves.len() > MAX_TREE_NODES {
-                warnings.push(format!("{name}: leaf chain loops"));
+                tree_problem(warnings, incomplete, format_args!("{name}: leaf chain loops or exceeds the node limit"));
                 break;
             }
             let Some(n) = self.block(data, node_id) else {
-                warnings.push(format!("{name}: missing leaf {node_id}"));
+                tree_problem(warnings, incomplete, format_args!("{name}: missing leaf {node_id}"));
                 break;
             };
             let nr = Reader::new(n);
-            let count = usize::from(nr.u16_be(2).unwrap_or(0));
+            let Some((leaf, count, next)) = node_header(n) else {
+                tree_problem(warnings, incomplete, format_args!("{name}: leaf {node_id} header cut short"));
+                break;
+            };
+            if !leaf {
+                tree_problem(warnings, incomplete, format_args!("{name}: forward link reaches a non-leaf node {node_id}"));
+                break;
+            }
             for i in 0..count {
                 let (Some(v), Some(k)) = (nr.u32_be(12 + i * 8), nr.u32_be(16 + i * 8)) else {
-                    warnings.push(format!("{name}: leaf {node_id} cut short"));
+                    tree_problem(warnings, incomplete, format_args!("{name}: leaf {node_id} cut short"));
                     break;
                 };
                 match (self.block(data, k), self.block(data, v)) {
                     (Some(kb), Some(vb)) => out.push((kb, vb)),
                     _ => {
-                        if warnings.len() < 100 {
-                            warnings.push(format!("{name}: entry points at a missing block"));
-                        }
+                        tree_problem(warnings, incomplete, format_args!("{name}: entry points at a missing block"));
                     }
                 }
                 if out.len() >= MAX_TREE_ENTRIES {
-                    warnings.push(format!("{name}: stopped at {MAX_TREE_ENTRIES} entries"));
+                    if i + 1 < count || next != 0 {
+                        tree_problem(warnings, incomplete, format_args!("{name}: stopped at {MAX_TREE_ENTRIES} entries"));
+                    }
                     return out;
                 }
             }
-            node_id = nr.u32_be(4).unwrap_or(0);
+            node_id = next;
         }
         out
+    }
+}
+
+/// A node's fixed header, including its backward link even when only forward traversal is used.
+fn node_header(data: &[u8]) -> Option<(bool, usize, u32)> {
+    let r = Reader::new(data);
+    r.slice(0, 12)?;
+    Some((r.u16_be(0)? != 0, usize::from(r.u16_be(2)?), r.u32_be(4)?))
+}
+
+fn tree_problem(warnings: &mut Vec<String>, incomplete: &mut bool, message: std::fmt::Arguments<'_>) {
+    *incomplete = true;
+    if warnings.len() < 100 {
+        warnings.push(message.to_string());
     }
 }
 
@@ -250,6 +293,7 @@ impl Bom {
 pub fn parse(data: &[u8]) -> Result<AssetCatalog, FormatError> {
     let bom = parse_bom(data)?;
     let mut warnings = Vec::new();
+    let mut tree_incomplete = false;
     let header = bom.var(data, "CARHEADER").and_then(|b| {
         let r = Reader::new(b);
         Some(CarHeader {
@@ -303,7 +347,7 @@ pub fn parse(data: &[u8]) -> Result<AssetCatalog, FormatError> {
     let key_format: Vec<String> = key_ids.iter().map(|&i| attribute_name(i)).collect();
     let mut facets = Vec::new();
     let mut ident_to_facet: BTreeMap<u16, String> = BTreeMap::new();
-    for (k, v) in bom.tree(data, "FACETKEYS", &mut warnings) {
+    for (k, v) in bom.tree_entries(data, "FACETKEYS", &mut warnings, &mut tree_incomplete) {
         let name = String::from_utf8_lossy(k).trim_end_matches('\0').to_string();
         let r = Reader::new(v);
         let n = usize::from(r.u16_le(4).unwrap_or(0));
@@ -318,7 +362,7 @@ pub fn parse(data: &[u8]) -> Result<AssetCatalog, FormatError> {
         facets.push(Facet { name, attributes });
     }
     let appearances = bom
-        .tree(data, "APPEARANCEKEYS", &mut warnings)
+        .tree_entries(data, "APPEARANCEKEYS", &mut warnings, &mut tree_incomplete)
         .into_iter()
         .map(|(k, v)| {
             let r = Reader::new(v);
@@ -327,7 +371,7 @@ pub fn parse(data: &[u8]) -> Result<AssetCatalog, FormatError> {
         .collect();
     let ident_pos = key_ids.iter().position(|&i| i == 17);
     let mut renditions = Vec::new();
-    for (k, v) in bom.tree(data, "RENDITIONS", &mut warnings) {
+    for (k, v) in bom.tree_entries(data, "RENDITIONS", &mut warnings, &mut tree_incomplete) {
         let kr = Reader::new(k);
         let mut key = BTreeMap::new();
         for (i, id) in key_ids.iter().enumerate() {
@@ -375,7 +419,7 @@ pub fn parse(data: &[u8]) -> Result<AssetCatalog, FormatError> {
         };
         renditions.push(rd);
     }
-    Ok(AssetCatalog { bom, header, extended_metadata, key_format, facets, appearances, renditions, warnings })
+    Ok(AssetCatalog { bom, header, extended_metadata, key_format, facets, appearances, renditions, tree_incomplete, warnings })
 }
 
 #[cfg(test)]

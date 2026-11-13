@@ -68,11 +68,11 @@ pub fn uid_of(v: &Value) -> Option<u64> {
     }
 }
 
-fn kind_of(v: &Value) -> &'static str {
+fn kind_of(v: &Value, index: usize) -> &'static str {
     match v {
         Value::Dict(_) => "object",
         Value::Array(_) => "array",
-        Value::String(s) if s == "$null" => "null",
+        Value::String(s) if index == 0 && s == "$null" => "null",
         Value::String(_) => "string",
         Value::Integer(_) => "integer",
         Value::Real(_) => "real",
@@ -94,7 +94,8 @@ impl KeyedArchive {
         self.class_name(idx).map(str::to_owned)
     }
 
-    fn class_name(&self, idx: u64) -> Option<&str> {
+    /// The class name borrowed from its shared class object, without copying the text.
+    pub fn class_name(&self, idx: u64) -> Option<&str> {
         let o = self.object(idx)?;
         let c = o.get("$class").and_then(uid_of)?;
         self.object(c)?.get("$classname").and_then(Value::as_str)
@@ -102,9 +103,16 @@ impl KeyedArchive {
 
     /// The table of objects.
     pub fn rows(&self) -> Vec<ObjectRow> {
+        self.rows_page(0, usize::MAX)
+    }
+
+    /// Object rows in the requested range. Unrequested rows do not copy names or collect edges.
+    pub fn rows_page(&self, offset: usize, limit: usize) -> Vec<ObjectRow> {
         self.objects
             .iter()
             .enumerate()
+            .skip(offset)
+            .take(limit)
             .map(|(i, o)| {
                 let mut references = Vec::new();
                 collect_uids(o, &mut references, 0);
@@ -112,7 +120,7 @@ impl KeyedArchive {
                     Value::Dict(d) if uid_of(o).is_none() => d.iter().map(|(k, _)| k.clone()).collect(),
                     _ => Vec::new(),
                 };
-                let kind = if uid_of(o).is_some() { "uid" } else { kind_of(o) };
+                let kind = if uid_of(o).is_some() { "uid" } else { kind_of(o, i) };
                 ObjectRow { index: i, class: self.class_of(i as u64), kind, keys, references }
             })
             .collect()
@@ -200,7 +208,7 @@ impl Projector<'_> {
             return json!({"$ref": idx, "$note": "missing object"});
         };
         match obj {
-            Value::String(s) if s == "$null" => return Json::Null,
+            Value::String(s) if idx == 0 && s == "$null" => return Json::Null,
             Value::Dict(_) | Value::Array(_) | Value::Uid(_) => {}
             other => {
                 let copied = match other {

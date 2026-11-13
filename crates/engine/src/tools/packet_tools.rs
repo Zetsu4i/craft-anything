@@ -204,7 +204,7 @@ fn packets_capture_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
     );
     let mut lims = common_limitations();
     if !s.warnings.is_empty() {
-        lims.push(Limitation::new("read_warnings", "Part of the file could not be read; see warnings. Packets after the damage are not counted."));
+        lims.push(Limitation::new("read_warnings", "Some packets or timestamps may be missing from the summary. See the capture warnings for details."));
     }
     if s.undecoded_frames > 0 {
         lims.push(Limitation::new(
@@ -319,7 +319,7 @@ fn packets_fields_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, T
     let cov = Coverage::page(shown, matched, p.offset as u64);
     let mut lims = common_limitations();
     if !cap.warnings.is_empty() {
-        lims.push(Limitation::new("read_warnings", "Part of the file could not be read; packets after the damage are not listed."));
+        lims.push(Limitation::new("read_warnings", "Some packets or timestamps may be missing from the listing. See the capture warnings for details."));
     }
     let filtered = want_proto.is_some() || want_ip.is_some() || p.port.is_some() || want_flow.is_some();
     let summary =

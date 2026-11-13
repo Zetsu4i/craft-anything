@@ -121,7 +121,7 @@ pub fn config_qualifiers(r: &Reader<'_>, off: usize) -> (String, String) {
         q.push(format!("mcc{mcc}"));
     }
     if let Some(mnc) = get16(6).filter(|&v| v != 0) {
-        q.push(format!("mnc{mnc}"));
+        q.push(format!("mnc{}", if mnc == u16::MAX { 0 } else { mnc }));
     }
     let lang = if size >= 12 { r.slice(off + 8, 2).map(|b| unpack_code(b, b'a')).unwrap_or_default() } else { String::new() };
     let region = if size >= 12 { r.slice(off + 10, 2).map(|b| unpack_code(b, b'0')).unwrap_or_default() } else { String::new() };
@@ -150,6 +150,14 @@ pub fn config_qualifiers(r: &Reader<'_>, off: usize) -> (String, String) {
     if !locale.is_empty() {
         q.push(locale.clone());
     }
+    let axis = |q: &mut Vec<String>, v: Option<u8>, mask, names: &[(u8, &str)]| {
+        if let Some(key) = v.map(|n| n & mask)
+            && let Some((_, name)) = names.iter().find(|(value, _)| *value == key)
+        {
+            q.push((*name).to_owned());
+        }
+    };
+    axis(&mut q, get8(19), 0x03, &[(1, "neuter"), (2, "feminine"), (3, "masculine")]);
     if let Some(sl) = get8(28) {
         match sl & 0xc0 {
             0x40 => q.push("ldltr".into()),
@@ -180,6 +188,9 @@ pub fn config_qualifiers(r: &Reader<'_>, off: usize) -> (String, String) {
             _ => {}
         }
     }
+    axis(&mut q, get8(48), 0x03, &[(1, "notround"), (2, "round")]);
+    axis(&mut q, get8(49), 0x03, &[(1, "nowidecg"), (2, "widecg")]);
+    axis(&mut q, get8(49), 0x0c, &[(4, "lowdr"), (8, "highdr")]);
     match get8(12) {
         Some(1) => q.push("port".into()),
         Some(2) => q.push("land".into()),
@@ -221,12 +232,14 @@ pub fn config_qualifiers(r: &Reader<'_>, off: usize) -> (String, String) {
         Some(3) => q.push("finger".into()),
         _ => {}
     }
+    axis(&mut q, get8(18), 0x03, &[(1, "keysexposed"), (2, "keyshidden"), (3, "keyssoft")]);
     match get8(16) {
         Some(1) => q.push("nokeys".into()),
         Some(2) => q.push("qwerty".into()),
         Some(3) => q.push("12key".into()),
         _ => {}
     }
+    axis(&mut q, get8(18), 0x0c, &[(4, "navexposed"), (8, "navhidden")]);
     match get8(17) {
         Some(1) => q.push("nonav".into()),
         Some(2) => q.push("dpad".into()),
@@ -317,6 +330,14 @@ fn parse_package(data: &[u8], pos: usize, cs: usize, global: &StringPool, table:
     }
     let id = r.u32_le(pos + 8).unwrap_or(0);
     let name = utf16_fixed(&r, pos + 12, 128);
+    // Older 284-byte packages predate this field. Type names still use the
+    // unshifted chunk ID, while public resource identities include the offset.
+    let type_id_offset = if hsize >= 288 { r.u32_le(pos + 284).unwrap_or(0) } else { 0 };
+    let Ok(type_id_offset) = u8::try_from(type_id_offset) else {
+        table.truncated = true;
+        table.warnings.push(format!("package {name}: type ID offset is outside the one-byte type field"));
+        return;
+    };
     let type_strings = r.u32_le(pos + 268).unwrap_or(0) as usize;
     let key_strings = r.u32_le(pos + 276).unwrap_or(0) as usize;
     let end = data.len();
@@ -359,16 +380,16 @@ fn parse_package(data: &[u8], pos: usize, cs: usize, global: &StringPool, table:
             break;
         };
         let r = Reader::new(child);
-        match ct {
-            RES_TYPE_SPEC if ch >= 16 => {
-                let tid = r.u8(c + 8).unwrap_or(0);
+        let local_tid = r.u8(c + 8).unwrap_or(0);
+        let type_id = local_tid.checked_add(type_id_offset).filter(|_| local_tid != 0);
+        match (ct, type_id) {
+            (RES_TYPE_SPEC, Some(tid)) if ch >= 16 => {
                 let count = r.u32_le(c + 12).unwrap_or(0);
                 if !package.types.iter().any(|t| t.id == tid) && package.types.len() < 256 {
-                    package.types.push(TypeInfo { id: tid, name: type_name(&p, tid), entry_count: count, configs: Vec::new() });
+                    package.types.push(TypeInfo { id: tid, name: type_name(&p, local_tid), entry_count: count, configs: Vec::new() });
                 }
             }
-            RES_TYPE if ch >= 24 => {
-                let tid = r.u8(c + 8).unwrap_or(0);
+            (RES_TYPE, Some(tid)) if ch >= 24 => {
                 let (cfg, _) = config_qualifiers(&r, c + 20);
                 match package.types.iter_mut().find(|t| t.id == tid) {
                     Some(t) => {
@@ -378,13 +399,22 @@ fn parse_package(data: &[u8], pos: usize, cs: usize, global: &StringPool, table:
                     }
                     None => {
                         if package.types.len() < 256 {
-                            package.types.push(TypeInfo { id: tid, name: type_name(&p, tid), entry_count: r.u32_le(c + 12).unwrap_or(0), configs: vec![cfg] })
+                            package.types.push(TypeInfo {
+                                id: tid,
+                                name: type_name(&p, local_tid),
+                                entry_count: r.u32_le(c + 12).unwrap_or(0),
+                                configs: vec![cfg],
+                            })
                         }
                     }
                 }
-                parse_type(&r, c, ch, sz, &p, global, table, limits);
+                parse_type(&r, c, ch, sz, &p, tid, global, table, limits);
             }
-            RES_LIBRARY if ch >= 12 => {
+            (RES_TYPE_SPEC | RES_TYPE, None) if ch >= 16 => {
+                table.truncated = true;
+                table.warnings.push(format!("package {name}: type ID {local_tid} with offset {type_id_offset} is outside the one-byte type field"));
+            }
+            (RES_LIBRARY, _) if ch >= 12 => {
                 let n = r.u32_le(c + 8).unwrap_or(0) as usize;
                 let available = (sz - ch) / 260;
                 if n > available {
@@ -397,7 +427,7 @@ fn parse_package(data: &[u8], pos: usize, cs: usize, global: &StringPool, table:
                     }
                 }
             }
-            RES_TYPE_SPEC | RES_TYPE | RES_LIBRARY => {
+            (RES_TYPE_SPEC | RES_TYPE | RES_LIBRARY, _) => {
                 table.warnings.push(format!("package {name}: incomplete chunk header at offset {c}"));
             }
             _ => {}
@@ -411,7 +441,7 @@ fn parse_package(data: &[u8], pos: usize, cs: usize, global: &StringPool, table:
 }
 
 #[allow(clippy::too_many_arguments)]
-fn parse_type(r: &Reader<'_>, c: usize, ch: usize, sz: usize, p: &Pkg<'_>, global: &StringPool, table: &mut Table, limits: Limits) {
+fn parse_type(r: &Reader<'_>, c: usize, ch: usize, sz: usize, p: &Pkg<'_>, type_id: u8, global: &StringPool, table: &mut Table, limits: Limits) {
     let tid = r.u8(c + 8).unwrap_or(0);
     let flags = r.u8(c + 9).unwrap_or(0);
     let count = r.u32_le(c + 12).unwrap_or(0) as usize;
@@ -426,6 +456,10 @@ fn parse_type(r: &Reader<'_>, c: usize, ch: usize, sz: usize, p: &Pkg<'_>, globa
     let table_bytes = if sparse || off16 { count.saturating_mul(if sparse { 4 } else { 2 }) } else { count.saturating_mul(4) };
     if c.saturating_add(ch).saturating_add(table_bytes) > end {
         table.warnings.push(format!("{tname} ({cfg}): entry table runs past its chunk"));
+        return;
+    }
+    if count != 0 && (entries_start < ch.saturating_add(table_bytes) || entries_start > sz) {
+        table.warnings.push(format!("{tname} ({cfg}): invalid entry data start"));
         return;
     }
     for i in 0..count {
@@ -456,7 +490,7 @@ fn parse_type(r: &Reader<'_>, c: usize, ch: usize, sz: usize, p: &Pkg<'_>, globa
         }
         let esize = usize::from(r.u16_le(e).unwrap_or(0));
         let eflags = r.u16_le(e + 2).unwrap_or(0);
-        let id = (p.id << 24) | (u32::from(tid) << 16) | (idx & 0xffff);
+        let id = (p.id << 24) | (u32::from(type_id) << 16) | (idx & 0xffff);
         let mut entry = Entry {
             id: format!("{id:#010x}"),
             package: p.name.to_string(),
@@ -480,12 +514,27 @@ fn parse_type(r: &Reader<'_>, c: usize, ch: usize, sz: usize, p: &Pkg<'_>, globa
         } else {
             entry.key = r.u32_le(e + 4).and_then(|k| p.keys.get(k)).unwrap_or("").to_string();
             if eflags & 0x01 != 0 {
+                if esize < 16 || e.saturating_add(esize) > end {
+                    table.truncated = true;
+                    table.warnings.push(format!("{tname} ({cfg}): incomplete bag header"));
+                    table.entries.push(entry);
+                    continue;
+                }
+                let n = r.u32_le(e + 12).unwrap_or(0) as usize;
+                let mut m = e + esize;
+                if n > (end - m) / 12 {
+                    table.truncated = true;
+                    table.warnings.push(format!("{tname} ({cfg}): incomplete bag data"));
+                    table.entries.push(entry);
+                    continue;
+                }
                 let parent = r.u32_le(e + 8).unwrap_or(0);
                 if parent != 0 {
                     entry.parent = Some(format!("@{parent:#010x}"));
                 }
-                let n = r.u32_le(e + 12).unwrap_or(0) as usize;
-                let mut m = e.saturating_add(esize.max(16));
+                if n > MAX_BAG {
+                    table.truncated = true;
+                }
                 for _ in 0..n.min(MAX_BAG) {
                     if m.saturating_add(12) > end {
                         break;

@@ -328,6 +328,32 @@ pub struct AgentLoop {
     /// Context windows servers said they have, by chain position: a request that didn't fit
     /// tells us the real size (#962), which may be smaller than the budget we assumed.
     server_windows: BTreeMap<usize, u64>,
+    /// What each backend's server said its window is when asked ahead of time, by chain position:
+    /// how many times it was asked and the window it named (see [`AgentLoop::ask_window`]).
+    read_windows: BTreeMap<usize, (u8, Option<u64>)>,
+}
+
+/// How many times a server is asked for its window: before the backend's first turn, and once
+/// after it, since Ollama and LM Studio say it only once the model is loaded.
+const WINDOW_ASKS: u8 = 2;
+
+/// The input tokens a conversation may take before room is made. `configured` is the budget the
+/// person set (zero: none); `refused` the window a server named when it refused a request (#962);
+/// `read` the window it named when asked ahead of time. Each window keeps a quarter free for the
+/// answer. A refusal is the truth; a window read ahead may raise a local model's budget, but only
+/// lowers a paid service's default, where a bigger window costs more on every request. A budget
+/// the person set is kept up to the window, on any backend.
+pub(crate) fn context_budget_from(configured: u64, refused: Option<u64>, read: Option<u64>, local: bool) -> u64 {
+    let room = |window: u64| window - window / 4;
+    let known = refused.map(room).or_else(|| read.map(room));
+    match (configured, known) {
+        (0, Some(room)) if refused.is_none() && !local => room.min(context::CLOUD_CONTEXT_TOKENS),
+        (0, Some(room)) => room,
+        (n, Some(room)) => n.min(room),
+        (0, None) if local => context::LOCAL_CONTEXT_TOKENS,
+        (0, None) => context::CLOUD_CONTEXT_TOKENS,
+        (n, None) => n,
+    }
 }
 
 impl AgentLoop {
@@ -523,16 +549,24 @@ impl AgentLoop {
     fn context_budget(&self) -> u64 {
         let slot = self.chain.get(self.current);
         let configured = if self.cfg.context_tokens == 0 { slot.map(|s| s.context_tokens).unwrap_or(0) } else { self.cfg.context_tokens };
-        // A window the server reported replaces our guess (a budget the person set stays the most),
-        // with a quarter of it left free for the answer.
-        let reported = self.server_windows.get(&self.current).map(|window| window - window / 4);
-        match (configured, reported) {
-            (0, Some(room)) => room,
-            (n, Some(room)) => n.min(room),
-            (0, None) if slot.is_some_and(|s| s.local) => context::LOCAL_CONTEXT_TOKENS,
-            (0, None) => context::CLOUD_CONTEXT_TOKENS,
-            (n, None) => n,
+        let refused = self.server_windows.get(&self.current).copied();
+        let read = self.read_windows.get(&self.current).and_then(|(_, window)| *window);
+        context_budget_from(configured, refused, read, slot.is_some_and(|s| s.local))
+    }
+
+    /// Ask the current backend's server how large its context window is, so the budget fits the
+    /// model instead of a guess: up to [`WINDOW_ASKS`] times, until it names one.
+    fn ask_window(&mut self) {
+        let (asked, window) = self.read_windows.get(&self.current).copied().unwrap_or((0, None));
+        if window.is_some() || asked >= WINDOW_ASKS {
+            return;
         }
+        let Some(slot) = self.chain.get(self.current) else { return };
+        let read = slot.model.context_window();
+        if let Some(w) = read {
+            self.host.journal("context", json!({"action": "window", "backend": slot.name, "window": w.tokens, "source": w.source}));
+        }
+        self.read_windows.insert(self.current, (asked.saturating_add(1), read.map(|w| w.tokens)));
     }
 
     /// Make room when the conversation has outgrown its budget: trim old tool results first; when
@@ -622,6 +656,7 @@ impl AgentLoop {
         // Chain positions already fitted to a window their server reported: each is asked once more.
         let mut refitted = BTreeSet::new();
         loop {
+            self.ask_window();
             // A fallback can have a smaller window than the backend that just failed.
             if let Some((usage, cost)) = self.fit_context(system, tools) {
                 msg_usage.add(usage);
@@ -866,6 +901,7 @@ impl ApiConversation {
             failure: failure.clone(),
             failed_builds: 0,
             server_windows: BTreeMap::new(),
+            read_windows: BTreeMap::new(),
         };
         let busy2 = busy.clone();
         std::thread::Builder::new()
@@ -1424,6 +1460,7 @@ pub(crate) mod tests {
             failure: Arc::default(),
             failed_builds: 0,
             server_windows: BTreeMap::new(),
+            read_windows: BTreeMap::new(),
         };
         let tools = [ToolDef { name: "look".into(), description: "x".repeat(4000), schema: json!({"type": "object"}) }];
 
@@ -1445,6 +1482,67 @@ pub(crate) mod tests {
         assert_eq!(kind, "context");
         assert_eq!(entry["budget"], 1000);
         assert!(entry["tokens_before"].as_u64().is_some_and(|n| n > 2000), "{entry}");
+    }
+
+    #[test]
+    fn a_window_read_from_the_server_sizes_the_budget() {
+        let cloud = context::CLOUD_CONTEXT_TOKENS;
+        for (configured, refused, read, local, budget) in [
+            (0, None, None, true, context::LOCAL_CONTEXT_TOKENS),
+            (0, None, Some(524_288), true, 393_216),
+            (0, None, Some(8192), true, 6144),
+            (1000, None, Some(524_288), true, 1000),
+            (0, Some(65_536), Some(524_288), true, 49_152),
+            (0, None, Some(1_000_000), false, cloud),
+            (0, None, Some(32_768), false, 24_576),
+            (0, None, None, false, cloud),
+            // A budget set on a paid service isn't cut to the default, only to the window.
+            (390_000, None, Some(1_000_000), false, 390_000),
+            (390_000, None, Some(200_000), false, 150_000),
+            (390_000, Some(1_000_000), None, false, 390_000),
+            (0, Some(1_000_000), None, false, 750_000),
+        ] {
+            assert_eq!(context_budget_from(configured, refused, read, local), budget, "{configured} {refused:?} {read:?} local {local}");
+        }
+    }
+
+    /// Says nothing the first time it's asked (the model isn't loaded yet), then `window`.
+    struct Windowed {
+        inner: Scripted,
+        asks: Arc<std::sync::atomic::AtomicUsize>,
+        window: Option<u64>,
+    }
+
+    impl ChatModel for Windowed {
+        fn turn(&mut self, req: &TurnRequest<'_>, on_delta: &mut dyn FnMut(Delta), stop: &Stop) -> Result<TurnResult, ToolError> {
+            self.inner.turn(req, on_delta, stop)
+        }
+        fn model(&self) -> String {
+            "windowed".into()
+        }
+        fn context_window(&self) -> Option<crate::window::Window> {
+            let n = self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.window.filter(|_| n > 0).map(|tokens| crate::window::Window { tokens, source: "test" })
+        }
+    }
+
+    #[test]
+    fn a_server_is_asked_for_its_window_until_it_names_one() {
+        for (window, asks) in [(Some(65_536), 2), (None, WINDOW_ASKS as usize)] {
+            let host = Arc::new(FakeHost { calls: Mutex::default(), journal: Mutex::default() });
+            let look = |id: &str| turn(vec![Block::ToolUse { id: id.into(), name: "look".into(), input: json!({}) }], StopReason::ToolUse);
+            let turns = VecDeque::from([look("a"), look("b"), look("c"), turn(vec![Block::Text { text: "done".into() }], StopReason::EndTurn)]);
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let model = Windowed { inner: Scripted { turns, seen: Arc::default() }, asks: counter.clone(), window };
+            let slot = ModelSlot { name: "Local".into(), model: Box::new(model), local: true, effort: None, max_turns: 10, context_tokens: 0 };
+            let mut conversation = ApiConversation::start(host.clone(), vec![slot], LoopConfig::default()).unwrap();
+            conversation.send("Build it");
+            drain_until_done(&mut conversation, |_, _| {});
+            assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), asks, "four turns, {window:?}");
+            let journal = host.journal.lock().unwrap();
+            let named = journal.iter().find(|(kind, entry)| kind == "context" && entry["action"] == "window");
+            assert_eq!(named.map(|(_, entry)| entry["window"].as_u64()), window.map(Some), "{journal:?}");
+        }
     }
 
     #[test]

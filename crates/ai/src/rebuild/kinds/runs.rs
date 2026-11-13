@@ -85,6 +85,14 @@ pub fn captured(ws: &Workspace) -> Vec<Value> {
     CASES.iter().filter_map(|(name, _)| std::fs::read(dir.join(format!("{}.json", slug(name)))).ok()).filter_map(|b| serde_json::from_slice(&b).ok()).collect()
 }
 
+/// The original program's name, which its printed text may contain. Clean room takes it from the
+/// picked path; only Deep mode looks inside (a launcher's script, an app bundle's Info.plist).
+pub(crate) fn original_name(target: &TargetRef, deep: bool) -> String {
+    let TargetRef::Local { path } = target else { return String::new() };
+    let program = if deep { locate(path, false).0 } else { path.clone() };
+    program.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
 fn slug(name: &str) -> String {
     let s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
     s.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-")
@@ -107,7 +115,7 @@ fn result_of(out: &ToolOutput) -> Value {
 }
 
 impl Worker {
-    /// Run the original console program with each input and keep what it did in capture/runs/;
+    /// Run the original console program twice with each input and keep both observations in capture/runs/;
     /// returns the README section, or None (and keeps nothing) when it didn't run like a console
     /// program.
     pub(in crate::rebuild) fn capture_runs(&self, program: &Path, capture: &Path) -> Result<Option<String>, ToolError> {
@@ -122,9 +130,13 @@ impl Worker {
             if let Some(cwd) = program.parent() {
                 params["working_directory"] = json!(cwd.display().to_string());
             }
-            match self.call("runtime_walkthrough_record", params) {
+            match self.call("runtime_walkthrough_record", params.clone()) {
                 Ok(out) => {
-                    let record = run_record(name, &args, &result_of(&out));
+                    let mut record = run_record(name, &args, &result_of(&out));
+                    match self.call("runtime_walkthrough_record", params) {
+                        Ok(repeat) => record["repeat"] = run_record(name, &args, &result_of(&repeat)),
+                        Err(e) => log::warn!("repeating {} with {name} failed: {}", program.display(), e.message),
+                    }
                     let bytes = serde_json::to_vec_pretty(&record).map_err(|e| ToolError::internal(e.to_string()))?;
                     craft_anything_engine::project::write_atomic(&dir.join(format!("{}.json", slug(name))), &bytes)?;
                     kept.push(*name);
@@ -141,7 +153,7 @@ impl Worker {
             "\n## How it runs\n\nIt's a console program, but running it to see its output didn't work.\n".to_string()
         } else {
             format!(
-                "\n## How it runs\n\nIt's a console program. capture/runs/ holds what it printed and how it exited for each of these inputs: {}. Each file has the arguments, the exit code (or that it was still running after {} s) and the lines it left on the terminal.\n",
+                "\n## How it runs\n\nIt's a console program. capture/runs/ holds what it printed and how it exited for each of these inputs: {}. Each file has the arguments, the exit code (or that it was still running after {} s) and the lines it left on the terminal. A second observation, when available, identifies numbers that changed between the original's runs.\n",
                 kept.join(", "),
                 RUN_MS / 1000
             )
@@ -149,14 +161,61 @@ impl Worker {
     }
 }
 
-/// The words of a run's output, with both programs' own names made the same ("program"), so a
-/// usage line naming the rebuild's file still matches.
-fn output_words(run: &Value, names: &[String]) -> std::collections::BTreeMap<String, usize> {
+/// Match numeric spelling without rounding large integers through a float.
+fn number_pattern() -> Option<&'static regex::Regex> {
+    static NUMBERS: std::sync::LazyLock<Option<regex::Regex>> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)[+-]?(?:0x[0-9a-f]+|0b[01]+|0o[0-7]+|(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?)").ok());
+    NUMBERS.as_ref()
+}
+
+/// Separate ordered numbers from the words so variable timing or PIDs do not lower word likeness.
+fn numeric_parts(text: &str) -> Option<(Vec<&str>, String)> {
+    let pattern = number_pattern()?;
+    Some((pattern.find_iter(text).map(|m| m.as_str()).collect(), pattern.replace_all(text, " ").into_owned()))
+}
+
+/// Both programs' own names become "program", so a usage line naming the rebuild still matches.
+/// Only whole names are replaced: a program named `e2` must not erase the exponent in `1e2`.
+fn output_text(run: &Value, names: &[String]) -> String {
     let mut text = run.get("lines").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join("\n").to_lowercase();
+    let Some(pattern) = number_pattern() else { return text };
     for n in names.iter().filter(|n| !n.is_empty()) {
-        text = text.replace(&n.to_lowercase(), "program");
+        let n = n.to_lowercase();
+        // A bare numeric filename cannot be distinguished from a printed result.
+        if pattern.find(&n).is_some_and(|number| number.as_str() == n) {
+            continue;
+        }
+        let part_of_name = |c: char| c.is_alphanumeric() || c == '_';
+        let mut normalized = String::with_capacity(text.len());
+        let mut copied = 0;
+        let numeric_spans: Vec<_> = pattern.find_iter(&text).map(|m| m.range()).collect();
+        for (start, name) in text.match_indices(&n) {
+            let end = start + name.len();
+            let numeric_span = numeric_spans.get(numeric_spans.partition_point(|range| range.end <= start));
+            if numeric_span.is_some_and(|range| range.start < start) {
+                continue;
+            }
+            if text[..start].chars().next_back().is_some_and(part_of_name) || text[end..].chars().next().is_some_and(part_of_name) {
+                continue;
+            }
+            normalized.push_str(&text[copied..start]);
+            normalized.push_str("program");
+            copied = end;
+        }
+        normalized.push_str(&text[copied..]);
+        text = normalized;
     }
-    website::words(&text)
+    text
+}
+
+/// Numbers read back in a note: a few of them, or how many there were.
+fn listed(numbers: &[&str]) -> String {
+    match numbers {
+        [] => "nothing".to_string(),
+        [one] => (*one).to_string(),
+        [a, b] => format!("{a} and {b}"),
+        [a, b, more @ ..] => format!("{a}, {b} and {} more", more.len()),
+    }
 }
 
 /// Dice over word counts, 0..=100; two empty outputs are alike.
@@ -172,6 +231,11 @@ fn alike(a: &std::collections::BTreeMap<String, usize>, b: &std::collections::BT
 /// What one input's two runs claim: the same way out (exit code, or still running) and the same
 /// output. `names`: both programs' file names without extension.
 pub fn run_claims(original: &Value, built: &Value, names: &[String]) -> Vec<Claim> {
+    run_comparison(original, built, names).0
+}
+
+/// Keep the comparison scope for the check note even when successful claims omit their details.
+fn run_comparison(original: &Value, built: &Value, names: &[String]) -> (Vec<Claim>, String) {
     let name = original.get("name").and_then(Value::as_str).unwrap_or("its input");
     let how = |r: &Value| match (r.get("reason").and_then(Value::as_str), r.get("exit_code").and_then(Value::as_i64)) {
         (Some("exited"), Some(c)) => format!("exits with code {c}"),
@@ -179,11 +243,67 @@ pub fn run_claims(original: &Value, built: &Value, names: &[String]) -> Vec<Clai
         (Some(other), _) => format!("is still running ({other})"),
         (None, _) => "didn't run".to_string(),
     };
-    let score = alike(&output_words(original, names), &output_words(built, names));
-    vec![
-        Claim::new(format!("With {name}, it {} like the original", how(original)), how(original) == how(built), format!("it {}", how(built))),
-        Claim::new(format!("With {name}, it prints what the original prints"), score >= OUTPUT_ALIKE, format!("{score:.0}% of the words match")),
-    ]
+    let (original_text, built_text) = (output_text(original, names), output_text(built, names));
+    let word_score = |a: &str, b: &str| alike(&website::words(a), &website::words(b));
+    let legacy_score = word_score(&original_text, &built_text);
+    let (score, numbers_match, detail) =
+        if let Some(((original_numbers, original_words), (built_numbers, built_words))) = numeric_parts(&original_text).zip(numeric_parts(&built_text)) {
+            let repeat = original.get("repeat").filter(|r| r.get("lines").is_some_and(Value::is_array) && how(r) == how(original));
+            if original_numbers.is_empty() && built_numbers.is_empty() {
+                (legacy_score, true, format!("{legacy_score:.0}% of the words match"))
+            } else if let Some(repeat) = repeat {
+                let repeat_text = output_text(repeat, names);
+                if let Some((repeat_numbers, _)) = numeric_parts(&repeat_text) {
+                    let score = word_score(&original_words, &built_words);
+                    if original_numbers.len() == repeat_numbers.len() {
+                        let varying = original_numbers.iter().zip(&repeat_numbers).filter(|(a, b)| a != b).count();
+                        let matches = original_numbers.len() == built_numbers.len()
+                            && original_numbers.iter().zip(&repeat_numbers).zip(&built_numbers).all(|((a, repeat), built)| a != repeat || a == built);
+                        let detail = format!(
+                            "{score:.0}% of the words match; stable numeric output {}; {varying} varying numeric positions ignored",
+                            if matches { "matches in order" } else { "differs" }
+                        );
+                        (score, matches, detail)
+                    } else {
+                        (score, true, format!("{score:.0}% of the words match; the original's number count varies, so numeric comparison was skipped"))
+                    }
+                } else {
+                    (0.0, false, "numeric output could not be compared".to_string())
+                }
+            } else if website::words(&original_words).is_empty() && website::words(&built_words).is_empty() {
+                // Nothing but numbers, beside punctuation: word likeness has nothing to weigh (it
+                // keeps only words of two characters or more), so two different numbers would read
+                // as identical output. Without a repeat to say which numbers vary, compare the
+                // numbers themselves.
+                let matches = original_numbers == built_numbers;
+                let detail = if matches {
+                    format!("only numbers were printed, and they match in order ({})", listed(&original_numbers))
+                } else if let Some(at) = original_numbers.iter().zip(&built_numbers).position(|(a, b)| a != b) {
+                    // Name the first difference, not the whole lists: a long output would only say
+                    // "and n more" on both sides.
+                    format!(
+                        "only numbers were printed: number {} is {} where the original prints {}",
+                        at + 1,
+                        built_numbers.get(at).copied().unwrap_or("missing"),
+                        original_numbers.get(at).copied().unwrap_or_default()
+                    )
+                } else {
+                    format!("only numbers were printed: it prints {} numbers where the original prints {}", built_numbers.len(), original_numbers.len())
+                };
+                (legacy_score, matches, detail)
+            } else {
+                (legacy_score, true, format!("{legacy_score:.0}% of the words match; numeric stability was not observed, so only words were compared"))
+            }
+        } else {
+            (0.0, false, "numeric output could not be compared".to_string())
+        };
+    (
+        vec![
+            Claim::new(format!("With {name}, it {} like the original", how(original)), how(original) == how(built), format!("it {}", how(built))),
+            Claim::new(format!("With {name}, it prints what the original prints"), score >= OUTPUT_ALIKE && numbers_match, detail.clone()),
+        ],
+        detail,
+    )
 }
 
 /// Runs the rebuild with each input Study ran the original with and compares, claim by claim.
@@ -202,25 +322,24 @@ impl Check for RunsCheck {
         !captured(cx.ws).is_empty()
     }
 
+    /// Run the rebuilt program with each input the original was run with and compare the results.
     fn run(&self, cx: &mut CheckCx) -> Result<CheckResult, ToolError> {
         let (ws, round) = (cx.ws, cx.round);
         let godot = cx.godot();
         let Some((program, base)) = craft_anything_engine::outputs::launch(&ws.app_dir(), godot.as_deref()) else {
             return Ok(CheckResult::new(self.id(), round, false, screenshot::NO_PROGRAM));
         };
+        let program = craft_anything_engine::outputs::absolute_program(&program);
+        let working_directory = craft_anything_engine::workspace::absolute(&ws.app_dir());
         let out = ws.checks_dir().join(format!("round-{round}")).join(RUNS_DIR);
         std::fs::create_dir_all(&out).map_err(|e| ToolError::io(out.display(), e))?;
-        let original_name = match &ws.manifest.target {
-            TargetRef::Local { path } => locate(path, false).0.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let names = vec![original_name, program.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()];
+        let names = vec![original_name(&ws.manifest.target, cx.deep()), program.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()];
         let (mut claims, mut notes, mut artifacts) = (Vec::new(), Vec::new(), Vec::new());
         for original in captured(ws) {
             let name = original.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
             let mut args = base.clone();
             args.extend(original.get("arguments").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(String::from));
-            let params = json!({"executable": program.display().to_string(), "arguments": args, "working_directory": ws.app_dir().display().to_string(), "timeout_ms": RUN_MS, "idle_timeout_ms": RUN_MS, "settle_ms": 200});
+            let params = json!({"executable": program.display().to_string(), "arguments": args, "working_directory": working_directory.display().to_string(), "timeout_ms": RUN_MS, "idle_timeout_ms": RUN_MS, "settle_ms": 200});
             let built = match cx.call("runtime_walkthrough_record", params) {
                 Ok(o) => run_record(&name, &args, &result_of(&o)),
                 Err(e) => {
@@ -233,7 +352,9 @@ impl Check for RunsCheck {
                 craft_anything_engine::project::write_atomic(&file, &bytes)?;
                 artifacts.extend(file.strip_prefix(&ws.root).ok().map(Path::to_path_buf));
             }
-            claims.extend(run_claims(&original, &built, &names));
+            let (compared, detail) = run_comparison(&original, &built, &names);
+            notes.push(format!("With {name}: {detail}."));
+            claims.extend(compared);
         }
         let failed: Vec<String> = claims.iter().filter(|c| !c.passed).map(|c| format!("{} ({})", c.title, c.detail)).collect();
         notes.insert(
@@ -256,6 +377,102 @@ impl Check for RunsCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clean room names the original by the path that was picked; only Deep mode reads the app
+    /// bundle's Info.plist for the program inside it.
+    #[test]
+    fn clean_room_names_the_original_without_looking_inside() {
+        let d = tempfile::tempdir().unwrap();
+        let app = d.path().join("Tip Calculator.app");
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        std::fs::write(
+            app.join("Contents/Info.plist"),
+            r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>TipCalc</string></dict></plist>"#,
+        )
+        .unwrap();
+        std::fs::write(app.join("Contents/MacOS/TipCalc"), b"\xcf\xfa\xed\xfe").unwrap();
+        let target = TargetRef::Local { path: app };
+        assert_eq!(original_name(&target, false), "Tip Calculator");
+        assert_eq!(original_name(&target, true), "TipCalc");
+        assert_eq!(original_name(&TargetRef::None, true), "");
+    }
+
+    /// A run check from a relative project must give its child an absolute executable and working
+    /// folder; a relative working folder is refused before the program starts.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_project_runs_a_console_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cwd = std::env::current_dir().unwrap();
+        let d = tempfile::tempdir_in(&cwd).unwrap();
+        let relative = d.path().strip_prefix(&cwd).unwrap();
+        let ws = Workspace::create(relative, "Tool", "a console tool", TargetRef::None).unwrap();
+        let app = ws.app_dir();
+        std::fs::create_dir_all(app.join("target/debug")).unwrap();
+        std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"tool\"\n").unwrap();
+        let program = app.join("target/debug/tool");
+        std::fs::write(&program, "#!/bin/sh\nprintf 'hello\\n'\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let capture = ws.capture_dir().join(RUNS_DIR);
+        std::fs::create_dir_all(&capture).unwrap();
+        std::fs::write(capture.join("no-arguments.json"), r#"{"name":"no arguments","arguments":[],"reason":"exited","exit_code":0,"lines":["hello"]}"#)
+            .unwrap();
+
+        let worker = crate::rebuild::tests::check_worker(&ws, false);
+        let mut cx = CheckCx { worker: &worker, ws: &ws, round: 1, until: None };
+        let result = RunsCheck.run(&mut cx).unwrap();
+        assert!(!result.claims.is_empty(), "{}", result.note);
+        assert!(result.claims.iter().all(|c| c.passed), "{}", result.note);
+    }
+
+    #[test]
+    fn successful_run_notes_explain_numeric_comparison_limits() {
+        let run = |line: &str| json!({"reason":"exited", "exit_code":0, "lines":[line]});
+        let mut original = run("Result 42 completed in 123 ms");
+        original["repeat"] = run("Result 42 completed in 456 ms");
+        let (claims, detail) = run_comparison(&original, &run("Result 42 completed in 789 ms"), &[]);
+        assert!(claims.iter().all(|c| c.passed && c.detail.is_empty()));
+        assert!(detail.contains("1 varying numeric positions ignored"), "{detail}");
+
+        original["repeat"] = run("Result 42 completed in ms");
+        let (claims, detail) = run_comparison(&original, &run("Result 42 completed in 789 ms"), &[]);
+        assert!(claims.iter().all(|c| c.passed));
+        assert!(detail.contains("number count varies"), "{detail}");
+
+        for repeat in [Value::Null, json!({}), json!({"reason":"timeout", "lines":["Result 42"]})] {
+            original["repeat"] = repeat;
+            let (claims, detail) = run_comparison(&original, &run("Result 42 completed in 789 ms"), &[]);
+            assert!(claims.iter().all(|c| c.passed));
+            assert!(detail.contains("numeric stability was not observed"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn numbers_printed_alone_are_compared_without_a_repeat() {
+        let run = |line: &str| json!({"reason":"exited", "exit_code":0, "lines":[line]});
+        // Bare `4.5` and `9.0`: word likeness drops one-character words, so this was 100% alike.
+        let (claims, detail) = run_comparison(&run("4.5"), &run("9.0"), &[]);
+        assert!(!claims[1].passed, "different numbers are different output: {detail}");
+        assert!(claims[1].detail.contains("9.0") && claims[1].detail.contains("4.5"), "{}", claims[1].detail);
+        let (claims, detail) = run_comparison(&run("4.5"), &run("4.5"), &[]);
+        assert!(claims.iter().all(|c| c.passed), "the same number still matches: {detail}");
+        assert!(detail.contains("only numbers were printed"), "{detail}");
+        // Printing nothing where the original printed a number isn't alike either.
+        let (claims, detail) = run_comparison(&run("4.5"), &run(""), &[]);
+        assert!(!claims[1].passed, "{detail}");
+        assert!(detail.contains("0 numbers where the original prints 1"), "{detail}");
+        // Punctuation around the numbers doesn't make them text.
+        let (claims, detail) = run_comparison(&run("[4.5]"), &run(""), &[]);
+        assert!(!claims[1].passed, "brackets aren't words: {detail}");
+        // A long output names where it first differs, not "and n more" on both sides.
+        let (claims, detail) = run_comparison(&run("1 2 3 4 5"), &run("1 2 9 4 5"), &[]);
+        assert!(!claims[1].passed && detail.contains("number 3 is 9 where the original prints 3"), "{detail}");
+        // Words beside the numbers still decide: a timing that differs is not a failed build.
+        let (claims, detail) = run_comparison(&run("Result 42 completed in 123 ms"), &run("Result 42 completed in 987 ms"), &[]);
+        assert!(claims.iter().all(|c| c.passed), "{detail}");
+        assert!(detail.contains("numeric stability was not observed"), "{detail}");
+    }
 
     #[test]
     fn each_input_claims_the_same_exit_and_output() {

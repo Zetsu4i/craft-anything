@@ -39,6 +39,14 @@ fn is_ident_part(b: u8) -> bool {
     is_ident_start(b) || b.is_ascii_digit()
 }
 
+fn line_terminator_len(src: &str, offset: usize) -> usize {
+    match src.as_bytes().get(offset) {
+        Some(b'\n' | b'\r') => 1,
+        Some(0xe2) if src.get(offset..).is_some_and(|rest| rest.starts_with('\u{2028}') || rest.starts_with('\u{2029}')) => 3,
+        _ => 0,
+    }
+}
+
 /// Tokenize `src`, stopping after `max_tokens` (the flag says whether it stopped early).
 pub fn tokenize(src: &str, max_tokens: usize) -> (Vec<Token<'_>>, bool) {
     let mut out = Vec::new();
@@ -61,6 +69,11 @@ pub fn scan<'a>(src: &'a str, max_tokens: usize, mut emit: impl FnMut(Token<'a>)
             i += 1;
             continue;
         }
+        let line_end = line_terminator_len(src, i);
+        if line_end != 0 {
+            i += line_end;
+            continue;
+        }
         if count >= max_tokens {
             return true;
         }
@@ -69,7 +82,7 @@ pub fn scan<'a>(src: &'a str, max_tokens: usize, mut emit: impl FnMut(Token<'a>)
         let next = b.get(i + 1).copied().unwrap_or(0);
         // Comments.
         if c == b'/' && next == b'/' {
-            while i < b.len() && b.get(i) != Some(&b'\n') {
+            while i < b.len() && line_terminator_len(src, i) == 0 {
                 i += 1;
             }
             emit(Token { kind: TokKind::Comment, text: slice(start, i), offset: start });
@@ -121,13 +134,20 @@ pub fn scan<'a>(src: &'a str, max_tokens: usize, mut emit: impl FnMut(Token<'a>)
             i = i.min(b.len());
             tok_kind = TokKind::Template;
         } else if is_ident_start(c) {
-            while b.get(i).is_some_and(|&d| is_ident_part(d)) {
+            while b.get(i).is_some_and(|&d| is_ident_part(d) && (d < 0x80 || line_terminator_len(src, i) == 0)) {
                 i += 1;
             }
             tok_kind = TokKind::Ident;
         } else if c.is_ascii_digit() || (c == b'.' && next.is_ascii_digit()) {
-            while b.get(i).is_some_and(|&d| d.is_ascii_alphanumeric() || d == b'.' || d == b'_') {
-                i += 1;
+            let radix = c == b'0' && matches!(next, b'x' | b'X' | b'b' | b'B' | b'o' | b'O');
+            while let Some(&d) = b.get(i) {
+                let exp_sign =
+                    !radix && matches!(d, b'+' | b'-') && matches!(b.get(i.wrapping_sub(1)), Some(b'e' | b'E')) && b.get(i + 1).is_some_and(u8::is_ascii_digit);
+                if d.is_ascii_alphanumeric() || d == b'.' || d == b'_' || exp_sign {
+                    i += 1;
+                } else {
+                    break;
+                }
             }
             tok_kind = TokKind::Number;
         } else if c == b'/' && regex_allowed(last_sig) {
@@ -150,8 +170,8 @@ pub fn scan<'a>(src: &'a str, max_tokens: usize, mut emit: impl FnMut(Token<'a>)
             i = i.min(b.len());
             tok_kind = TokKind::Regex;
         } else {
-            let rest = slice(i, (i + 4).min(b.len()));
-            let len = PUNCTS.iter().find(|p| rest.starts_with(**p)).map_or(1, |p| p.len());
+            let rest = b.get(i..).unwrap_or_default();
+            let len = PUNCTS.iter().find(|p| rest.starts_with(p.as_bytes())).map_or(1, |p| p.len());
             // Never split a multi-byte character.
             let mut z = i + len;
             while z < b.len() && !src.is_char_boundary(z) {
@@ -330,6 +350,15 @@ mod tests {
     }
 
     #[test]
+    fn operators_before_non_ascii_identifier() {
+        for (src, op) in [("a===日本", "==="), ("a>>日本", ">>"), ("a=>é", "=>"), ("a!==😀", "!==")] {
+            let t: Vec<&str> = tokenize(src, 100).0.into_iter().map(|t| t.text).collect();
+            assert_eq!(t.len(), 3, "{src}: {t:?}");
+            assert_eq!(t[1], op, "{src}");
+        }
+    }
+
+    #[test]
     fn whitespace_does_not_count_against_limit() {
         let (t, truncated) = tokenize("a b c d", 4);
         assert_eq!(t.len(), 4);
@@ -337,6 +366,13 @@ mod tests {
         let (t, truncated) = tokenize("a b c d", 3);
         assert_eq!(t.len(), 3);
         assert!(truncated);
+    }
+
+    #[test]
+    fn exponent_sign() {
+        let texts = |s: &str| tokenize(s, 100).0.into_iter().map(|t| t.text.to_string()).collect::<Vec<_>>();
+        assert_eq!(texts("x = 1e+5 + 2.5E-3;"), ["x", "=", "1e+5", "+", "2.5E-3", ";"]);
+        assert_eq!(texts("0x1e+5"), ["0x1e", "+", "5"]);
     }
 
     #[test]

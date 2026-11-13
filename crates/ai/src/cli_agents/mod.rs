@@ -11,6 +11,7 @@
 pub mod acp;
 pub mod adapters;
 pub mod claude_cost;
+pub mod grants;
 pub mod models;
 mod shared;
 pub mod unfinished;
@@ -379,17 +380,22 @@ fn access_for(builder: bool, deep: bool, question: bool) -> Access {
     }
 }
 
-/// True when `program`'s help mentions every required flag (10 s limit, stdin closed).
-pub fn verify_flags(program: &str, help_args: &[&str], needed: &[&str]) -> bool {
+/// Whether `program`'s help mentions every required flag (10 s limit, stdin closed); `None` when
+/// the help couldn't be read (the program is missing, or too slow).
+pub fn verify_flags(program: &str, help_args: &[&str], needed: &[&str]) -> Option<bool> {
     if needed.is_empty() {
-        return true;
+        return Some(true);
     }
     match Process::new(program).args(help_args).timeout(Duration::from_secs(10)).stdout_cap(256 * 1024).run() {
         Ok(out) => {
             let text = format!("{}{}", out.stdout_text(), out.stderr_text());
-            needed.iter().all(|f| text.contains(f))
+            if needed.iter().all(|f| text.contains(f)) {
+                return Some(true);
+            }
+            // A failed probe that printed no usage (a broken launcher) says nothing about the version.
+            (out.code == Some(0) || text.to_ascii_lowercase().contains("usage")).then_some(false)
         }
-        Err(_) => false,
+        Err(_) => None,
     }
 }
 
@@ -972,6 +978,12 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
         });
         return nothing_done(&name);
     }
+    // An access mode this agent can't hold (Clean room, for one whose reads we can't check) is
+    // refused before anything else starts.
+    if let Err(e) = adapter.validate_access(access_for(spec.builder.is_some(), spec.deep, spec.question)) {
+        let _ = tx.send(AgentEvent::Error { message: e.message, remediation: e.remediation, log: None });
+        return nothing_done(&name);
+    }
     // The folder the agent's process starts in below.
     let cwd = remote.is_none().then(|| spec.project.clone().or_else(|| std::env::current_dir().ok())).flatten();
     if let Err(e) = adapter.check_native_options(&spec.options, cwd.as_deref()) {
@@ -989,12 +1001,20 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
     }
     let (help, needed) = adapter.required_flags();
     if !needed.is_empty() {
-        let ok = if remote.is_some() || spec.sandbox.is_some() {
-            true // can't cheaply check a CLI that runs elsewhere; its errors are streamed back
-        } else {
-            let mut v = verified.lock().unwrap_or_else(PoisonError::into_inner);
-            *v.get_or_insert_with(|| verify_flags(&program, help, needed))
+        let checked = match remote {
+            Some(_) => Some(true), // can't cheaply check a remote CLI; its errors are streamed back
+            None if spec.sandbox.is_some() => Some(true), // the same for a run in the project's sandbox
+            None => {
+                // Only a help with the flags is kept: anything else is checked again next turn, so
+                // a program updated in place is seen.
+                let mut v = verified.lock().unwrap_or_else(PoisonError::into_inner);
+                if *v != Some(true) {
+                    *v = verify_flags(&program, help, needed);
+                }
+                *v
+            }
         };
+        let ok = checked == Some(true);
         if !ok && adapter.plain_fallback() {
             let _ = tx.send(AgentEvent::Status {
                 text: format!("{program}'s help doesn't list {} here, so it runs with the plain adapter (prompt in, text out).", needed.join(" / ")),
@@ -1004,6 +1024,11 @@ fn run_cli(spec: &CliSpec, text: &str, retry: bool, tx: &Sender<AgentEvent>, sto
             // Forget it before retry chooses between the original request and a continuation.
             *session.lock().unwrap_or_else(PoisonError::into_inner) = None;
         } else if !ok {
+            // Only a help that was read and lacks the flags says which version this is (#1111).
+            if let Some((message, remediation)) = adapter.missing_flags_error().filter(|_| checked == Some(false)) {
+                let _ = tx.send(AgentEvent::Error { message: message.into(), remediation: Some(remediation.into()), log: None });
+                return nothing_done(&name);
+            }
             let _ = tx.send(AgentEvent::Status { text: format!("Couldn't confirm that {program} has {}; trying it anyway.", needed.join(" / ")) });
         }
     }
@@ -1389,7 +1414,7 @@ impl FailureContext {
     /// Why this run failed, when it was ssh (or the remote computer) that says so.
     fn ssh_failure(&self, out: &craft_anything_platform::Output) -> Option<crate::ssh::SshFailure> {
         let host = self.host.as_deref()?;
-        crate::ssh::diagnose(host, &self.program, crate::ssh::is_git_server(host), out.code, &out.stderr_text())
+        crate::ssh::diagnose(host, &self.program, crate::ssh::is_git_server(host), out.code, &out.end_text())
     }
 
     /// Write the log. Returns its path, or what to tell the person when it couldn't be written.
@@ -1432,7 +1457,7 @@ impl FailureContext {
     fn exit_event(&self, agent: &str, out: &craft_anything_platform::Output) -> AgentEvent {
         let name = display_for(agent);
         let plain = craft_anything_platform::process::nonzero_error_with(&name, out, Some(&self.command));
-        let excerpt = craft_anything_platform::process::output_excerpt(&String::from_utf8_lossy(if out.stderr.is_empty() { &out.stdout } else { &out.stderr }));
+        let excerpt = craft_anything_platform::process::output_excerpt(&out.end_text());
         let (message, mut remediation) = match self.ssh_failure(out) {
             Some(f) => {
                 let host = self.host.as_deref().unwrap_or_default();
@@ -2204,8 +2229,24 @@ mod tests {
             success: false,
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
+            stdout_tail: Vec::new(),
+            stderr_tail: Vec::new(),
             stdout_truncated: false,
             stderr_truncated: false,
+            duration: Duration::from_millis(400),
+        }
+    }
+
+    fn failed_with_tail(code: i32, head: &str, tail: &str) -> craft_anything_platform::Output {
+        craft_anything_platform::Output {
+            code: Some(code),
+            success: false,
+            stdout: Vec::new(),
+            stderr: head.as_bytes().to_vec(),
+            stdout_tail: Vec::new(),
+            stderr_tail: tail.as_bytes().to_vec(),
+            stdout_truncated: false,
+            stderr_truncated: true,
             duration: Duration::from_millis(400),
         }
     }
@@ -2238,6 +2279,17 @@ mod tests {
             assert!(text.contains(part), "{part} is missing from:\n{text}");
         }
         assert!(!text.contains("private plans"), "the message stays out of the log:\n{text}");
+    }
+
+    /// A truncated SSH failure is diagnosed and quoted from its end, not its kept head.
+    #[test]
+    fn a_truncated_ssh_failure_is_read_from_its_end() {
+        let ev = context(Some("github.com"), None)
+            .exit_event("claude-code", &failed_with_tail(255, "warning: lots of noise\n", "exec request failed on channel 0\n"));
+        let AgentEvent::Error { message, remediation, .. } = ev else { panic!("not an error") };
+        assert!(message.contains("github.com is a git server"), "{message}");
+        let help = remediation.unwrap();
+        assert!(help.contains("exec request failed on channel 0"), "{help}");
     }
 
     #[test]
@@ -3130,6 +3182,106 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
         assert!(said("trying it anyway") && !said("plain adapter"), "{all:?}");
     }
 
+    /// #1111: OpenCode 1.x's `run --help` lists no `--standalone` and rejects it, so the turn is
+    /// stopped with the fix before the program runs (it would print its usage and fail).
+    #[cfg(unix)]
+    #[test]
+    fn opencode_1_is_refused_before_it_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("opencode");
+        let ran = dir.path().join("ran");
+        // OpenCode 1.x's help, and a run of it that leaves a mark so the test sees it happened.
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = run ] && [ \"$2\" = --help ]; then printf '%s\\n' '--format --title --auto'; exit 0; fi\ntouch '{}'\nexit 1\n",
+            ran.display()
+        );
+        std::fs::write(&program, &script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config =
+            BackendConfig { name: "OpenCode".into(), kind: BackendKind::AgentCli, model: "opencode".into(), base_url: None, ssh_host: None, enabled: true };
+        let options = BackendOptions { command: Some(program.display().to_string()), ..Default::default() };
+        let mut c = CliConversation::new(CliSpec::new(config, options, false, None));
+        c.send("What does this program do?");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut all = Vec::new();
+        while std::time::Instant::now() < deadline && !all.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
+            all.extend(c.poll());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            all.iter().any(|e| matches!(
+                e,
+                AgentEvent::Error { message, remediation: Some(fix), .. }
+                    if message.contains("OpenCode 1.x") && fix.contains("@opencode/cli")
+            )),
+            "{all:?}"
+        );
+        let said = |w: &str| all.iter().any(|e| matches!(e, AgentEvent::Status { text } if text.contains(w)));
+        assert!(!said("trying it anyway"), "{all:?}");
+        assert!(!ran.exists(), "OpenCode 1.x ran anyway: {all:?}");
+
+        // Updated in place to OpenCode 2: the next turn checks again and runs it.
+        let v2 = dir.path().join("opencode-v2");
+        std::fs::write(&v2, script.replace("--format --title --auto", "--format --standalone")).unwrap();
+        std::fs::set_permissions(&v2, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&v2, &program).unwrap();
+        let all = one_turn(&mut c, "And now?");
+        assert!(!all.iter().any(|e| matches!(e, AgentEvent::Error { message, .. } if message.contains("1.x"))), "{all:?}");
+        assert!(ran.exists(), "OpenCode 2 didn't run: {all:?}");
+    }
+
+    /// A help probe that fails without printing usage (a broken launcher) isn't taken for
+    /// OpenCode 1.x: the run goes on and shows its own failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_help_probe_is_not_called_version_1() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("opencode");
+        std::fs::write(&program, "#!/bin/sh\necho 'env: node: No such file or directory' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config =
+            BackendConfig { name: "OpenCode".into(), kind: BackendKind::AgentCli, model: "opencode".into(), base_url: None, ssh_host: None, enabled: true };
+        let options = BackendOptions { command: Some(program.display().to_string()), ..Default::default() };
+        let mut c = CliConversation::new(CliSpec::new(config, options, false, None));
+        let all = one_turn(&mut c, "What does this program do?");
+        assert!(!all.iter().any(|e| matches!(e, AgentEvent::Error { message, .. } if message.contains("1.x"))), "{all:?}");
+        assert!(all.iter().any(|e| matches!(e, AgentEvent::Status { text } if text.contains("trying it anyway"))), "{all:?}");
+    }
+
+    /// Sends `text` and collects the turn's events up to its end. Only the Unix tests use it.
+    #[cfg(unix)]
+    fn one_turn(c: &mut CliConversation, text: &str) -> Vec<AgentEvent> {
+        c.send(text);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut all = Vec::new();
+        while std::time::Instant::now() < deadline && !all.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
+            all.extend(c.poll());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        all
+    }
+
+    /// A help that couldn't be read (here, no program) isn't taken for OpenCode 1.x: the run goes
+    /// on to say the program is missing.
+    #[test]
+    fn a_missing_opencode_is_not_called_version_1() {
+        let config =
+            BackendConfig { name: "OpenCode".into(), kind: BackendKind::AgentCli, model: "opencode".into(), base_url: None, ssh_host: None, enabled: true };
+        let options = BackendOptions { command: Some("no-such-opencode-xyz".into()), ..Default::default() };
+        let mut c = CliConversation::new(CliSpec::new(config, options, false, None));
+        c.send("What does this program do?");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut all = Vec::new();
+        while std::time::Instant::now() < deadline && !all.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
+            all.extend(c.poll());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(all.iter().any(|e| matches!(e, AgentEvent::Error { message, .. } if message.contains("isn't installed"))), "{all:?}");
+        assert!(!all.iter().any(|e| matches!(e, AgentEvent::Error { message, .. } if message.contains("1.x"))), "{all:?}");
+    }
+
     /// A fork's own agent: JSON lines of `{"say": …}`, registered under its id.
     struct EchoAgent;
     impl AgentAdapter for EchoAgent {
@@ -3336,5 +3488,31 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
             assert!(!fix.to_lowercase().contains("copilot"), "{fix}");
             assert_eq!(fix.contains("Use test-agent sign-in."), guidance.is_some());
         }
+    }
+
+    /// A Clean room run of an agent whose reads can't be checked is refused on the path every
+    /// native run takes, before its program starts.
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_room_run_of_aider_is_refused_before_it_starts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("aider");
+        std::fs::write(&program, "#!/bin/sh\necho run >> \"$(dirname \"$0\")/runs\"\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = BackendConfig { name: "Aider".into(), kind: BackendKind::AgentCli, model: "aider".into(), base_url: None, ssh_host: None, enabled: true };
+        let options = BackendOptions { command: Some(program.display().to_string()), ..Default::default() };
+        let mut spec = CliSpec::new(config, options, false, None);
+        spec.deep = false;
+        let mut c = CliConversation::new(spec);
+        c.send("x");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut all = Vec::new();
+        while std::time::Instant::now() < deadline && !all.iter().any(|e| matches!(e, AgentEvent::TurnDone { .. })) {
+            all.extend(c.poll());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(all.iter().any(|e| matches!(e, AgentEvent::Error { message, .. } if message.contains("Clean room"))), "{all:?}");
+        assert!(!dir.path().join("runs").exists(), "Aider must not start in a Clean room run");
     }
 }

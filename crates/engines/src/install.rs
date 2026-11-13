@@ -231,15 +231,33 @@ pub fn download_to(
     if !url.starts_with("https://") {
         return Err(ToolError::invalid("engine downloads must use https"));
     }
-    let agent = ureq::Agent::config_builder()
+    download_with_agent(url, sink, max_bytes, cancel, progress, &download_config().build().new_agent())
+}
+
+fn download_config() -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
+    ureq::Agent::config_builder()
+        .https_only(true)
         .http_status_as_error(false)
         .user_agent("CraftAnything-dev")
         .timeout_connect(Some(Duration::from_secs(20)))
         .timeout_recv_response(Some(Duration::from_secs(60)))
         .timeout_recv_body(Some(Duration::from_secs(60 * 20)))
-        .build()
-        .new_agent();
+}
+
+fn download_with_agent(
+    url: &str,
+    sink: &mut dyn Write,
+    max_bytes: u64,
+    cancel: Option<&Cancel>,
+    progress: &dyn Fn(u64, Option<u64>),
+    agent: &ureq::Agent,
+) -> Result<u64, ToolError> {
     let resp = agent.get(url).call().map_err(|e| {
+        if matches!(e, ureq::Error::RequireHttpsOnly(_)) {
+            // This error contains the redirect URI, which can carry a signed query or credentials.
+            return ToolError::new(ErrorCode::EngineMissing, "The engine download redirected to HTTP and was refused.")
+                .with_remediation("The download source must keep every redirect on HTTPS.");
+        }
         let code = if matches!(e, ureq::Error::Timeout(_)) { ErrorCode::TimedOut } else { ErrorCode::EngineMissing };
         ToolError::new(code, format!("Couldn't download {url}: {e}")).with_remediation("Check your internet connection and try again.")
     })?;
@@ -396,6 +414,9 @@ fn unpack_tar(data: &[u8], dest: &Path, strip_prefix: Option<&str>, cancel: Opti
         let (code, message) = match reason {
             StopReason::GnuMetadataTooLong => (ErrorCode::OverLimit, "A GNU tar name or link exceeds the supported limit; the archive was not unpacked."),
             StopReason::GnuMetadataTruncated => (ErrorCode::GarbledOutput, "The tar archive ends inside a GNU name or link record; it was not unpacked."),
+            StopReason::GlobalNameBudget => {
+                (ErrorCode::OverLimit, "The tar archive's inherited PAX names exceed the retained-name limit; it was not unpacked.")
+            }
         };
         return Err(ToolError::new(code, message).with_remediation("Use a complete archive with supported member names, or install this engine by hand."));
     }
@@ -459,6 +480,24 @@ fn set_executable(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_pax_name_copy_limit_refuses_installation_before_writes() {
+        use craft_anything_testkit::firmware as fx;
+        let global = format!("4107 path={}\n", "n".repeat(4096));
+        assert_eq!(global.len(), 4107);
+        let mut entries = vec![("pkg/bin/tool", b'0', b"replacement".as_slice(), ""), ("global", b'g', global.as_bytes(), "")];
+        entries.extend(std::iter::repeat_n(("ignored", b'0', b"".as_slice(), ""), 16_385));
+        let data = fx::tar_entries(&entries);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        let installed = dir.path().join("bin/tool");
+        std::fs::write(&installed, b"installed").unwrap();
+        let error = unpack_tar(&data, dir.path(), Some("pkg/"), None, &|_| {}).unwrap_err();
+        assert_eq!(error.code, ErrorCode::OverLimit);
+        assert!(error.message.contains("inherited PAX names"));
+        assert_eq!(std::fs::read(installed).unwrap(), b"installed");
+    }
 
     fn assert_gnu_metadata_refused_before_writes(kind: u8, cut_short: bool, expected: ErrorCode) {
         use craft_anything_testkit::firmware as fx;
@@ -791,3 +830,7 @@ mod tests {
         out
     }
 }
+
+#[cfg(test)]
+#[path = "install_download_tests.rs"]
+mod download_tests;

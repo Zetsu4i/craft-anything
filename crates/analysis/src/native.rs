@@ -287,7 +287,7 @@ pub fn function_info(prog: &Program, f: &Function, names: Names<'_>) -> Value {
 fn strings_used(prog: &Program, f: &Function) -> Vec<Value> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
-    for (from, xs) in prog.xrefs_from.range(f.entry..f.end.max(f.entry + 1)) {
+    for (from, xs) in f.address_bounds().into_iter().flat_map(|range| prog.xrefs_from.range(range)) {
         if !f.contains(*from) {
             continue;
         }
@@ -305,7 +305,7 @@ fn strings_used(prog: &Program, f: &Function) -> Vec<Value> {
 fn refs(prog: &Program, f: &Function, names: Names<'_>, outgoing: bool) -> Vec<Value> {
     let mut out = Vec::new();
     if outgoing {
-        for (from, xs) in prog.xrefs_from.range(f.entry..f.end.max(f.entry + 1)) {
+        for (from, xs) in f.address_bounds().into_iter().flat_map(|range| prog.xrefs_from.range(range)) {
             if !f.contains(*from) {
                 continue;
             }

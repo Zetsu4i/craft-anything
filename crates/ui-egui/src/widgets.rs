@@ -587,6 +587,11 @@ pub fn working_since(ui: &mut Ui, title: &str, detail: Option<&str>, began: Opti
     let secs = began.map_or((now - since) as u64, |b| b.elapsed().as_secs());
     let note = wait_note(secs, quiet);
     let sub = [detail.map(str::to_string), note].into_iter().flatten().collect::<Vec<_>>().join("  ·  ");
+    let clock = RichText::new(crate::usage::duration_words(std::time::Duration::from_secs(secs))).font(theme::mono(12.5)).color(t.text_faint);
+    // The words wrap before the clock, never under it: a right-to-left layout doesn't make room
+    // for what's already on the row.
+    let clock_width =
+        egui::WidgetText::from(clock.clone()).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::FontSelection::Default).size().x;
     card(&t).inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
@@ -599,14 +604,14 @@ pub fn working_since(ui: &mut Ui, title: &str, detail: Option<&str>, began: Opti
             ui.painter().add(egui::Shape::line(arc, Stroke::new(2.5, t.accent)));
             ui.add_space(4.0);
             ui.vertical(|ui| {
+                ui.set_max_width((ui.available_width() - clock_width - ui.spacing().item_spacing.x).max(0.0));
                 ui.label(RichText::new(tr(title)).font(theme::semibold(theme::BODY)).color(t.text));
                 if !sub.is_empty() {
                     ui.add(egui::Label::new(RichText::new(sub).color(t.text_dim).size(theme::SMALL)).wrap());
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let clock = crate::usage::duration_words(std::time::Duration::from_secs(secs));
-                ui.label(RichText::new(clock).font(theme::mono(12.5)).color(t.text_faint));
+                ui.label(clock);
             });
         });
         // An indeterminate sweep along the bottom: movement even when nothing new has arrived.
@@ -706,5 +711,32 @@ mod tests {
         assert!(quiet.contains("Nothing new for") && !quiet.contains("big one"), "{quiet}");
         assert_eq!(wait_note(4000, Some(Duration::from_secs(5))), None, "it's visibly moving: nothing to add");
         assert!(wait_note(4000, None).unwrap().contains("big one"), "without news to go on, the old note");
+    }
+
+    /// The working card's clock keeps its own space: the words wrap before it instead of running
+    /// under it, the way `stat_row`'s value does.
+    #[test]
+    fn the_works_clock_never_paints_over_the_words() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let began = std::time::Instant::now() - Duration::from_secs(42);
+        let mut h = Harness::new_ui_state(
+            move |ui, first: &mut bool| {
+                crate::theme::install_fonts(ui.ctx());
+                // Installed fonts become active at the next pass, and the card's title is set in
+                // the "semibold" family: draw it once they are.
+                if std::mem::replace(first, false) {
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                ui.set_width(300.0);
+                working_since(ui, "Working on it", Some("Now: Running a long command (42s)  ·  12 actions done so far"), Some(began), None);
+            },
+            true,
+        );
+        h.run_steps(3);
+        let clock = h.get_by_label("42s").rect();
+        let words = h.get_by_label_contains("Now: Running a long command").rect();
+        assert!(!clock.intersects(words), "the clock paints over the words: {clock:?} vs {words:?}");
+        assert!(clock.left() > words.right(), "the clock sits beside the words: {clock:?} vs {words:?}");
     }
 }

@@ -401,11 +401,7 @@ const MAX_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
 fn core_evidence_import(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: ImportParams = parse_params(params)?;
     let path = PathBuf::from(&p.path);
-    let len = std::fs::metadata(&path).map_err(|e| ToolError::io(path.display(), e))?.len();
-    if len > MAX_BUNDLE_BYTES {
-        return Err(ToolError::new(ErrorCode::OverLimit, "bundle is too large"));
-    }
-    let bytes = std::fs::read(&path).map_err(|e| ToolError::io(path.display(), e))?;
+    let bytes = craft_anything_platform::fs::read_file_capped(&path, MAX_BUNDLE_BYTES)?;
     let v: Value = serde_json::from_slice(&bytes).map_err(|e| ToolError::invalid(format!("not a bundle: {e}")))?;
     if v.get("format").and_then(Value::as_str) != Some(BUNDLE_FORMAT) {
         return Err(ToolError::invalid("not a Craft Anything evidence bundle"));

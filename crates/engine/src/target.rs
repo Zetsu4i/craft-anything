@@ -241,10 +241,7 @@ impl Target {
                 raw: None,
             });
         }
-        if meta.len() > MAX_TARGET_BYTES {
-            return Err(ToolError::new(ErrorCode::OverLimit, format!("{} is {} bytes; the limit is {MAX_TARGET_BYTES}", path.display(), meta.len())));
-        }
-        let bytes = std::fs::read(path).map_err(|e| ToolError::io(path.display(), e))?;
+        let bytes = craft_anything_platform::fs::read_file_capped(path, MAX_TARGET_BYTES)?;
         Ok(Target::from_bytes(path.to_path_buf(), name, bytes))
     }
 
@@ -263,11 +260,11 @@ impl Target {
         if self.kind == TargetKind::Directory {
             return Ok(());
         }
-        match std::fs::read(&self.path) {
+        match craft_anything_platform::fs::read_file_capped(&self.path, MAX_TARGET_BYTES) {
             Ok(b) if sha256_hex(&b) == self.sha256 => Ok(()),
             Ok(_) => Err(ToolError::new(ErrorCode::FileChanged, format!("{} changed on disk since it was opened", self.path.display()))
                 .with_remediation("Open it again to analyse the new version.")),
-            Err(e) => Err(ToolError::io(self.path.display(), e)),
+            Err(e) => Err(e),
         }
     }
 }
@@ -291,6 +288,9 @@ mod tests {
         assert_eq!(sniff(b"\xEF\xBB\xBFhello", "notes.txt"), TargetKind::Text);
         assert_eq!(sniff(b"\xFF\xFEh\0i\0", "notes.txt"), TargetKind::Text);
         assert_eq!(sniff(b"\0\xFF\x02", "notes.md"), TargetKind::Unknown);
+        // The bytes decide, not the name: a gzip stream called `.txt` is not text.
+        assert_eq!(sniff(b"\x1f\x8b\x08\x00\x00\x00", "notes.txt"), TargetKind::Unknown);
+        assert_eq!(sniff(b"", "empty.txt"), TargetKind::Unknown);
         assert_eq!(TargetKind::Text.id(), "text");
         assert!(TargetKind::Text.plain().contains("text file"));
     }

@@ -1467,3 +1467,24 @@ Connecting to {name}… {seconds} s	Připojování k {name}… {seconds} s
 Stopped adding {name}.	Přidávání {name} bylo zastaveno.
 It isn't there any more, so {program} runs in its place.	Už tam není, proto se místo něj spouští {program}.
 Use it	Použít
+
+# Native update checks and verified installation.
+ArtCraft Launcher manages this app's version. Change its version there.	Verzi této aplikace spravuje ArtCraft Launcher. Změňte ji tam.
+Check again	Zkontrolovat znovu
+Check for Updates	Vyhledat aktualizace
+Check for Updates…	Vyhledat aktualizace…
+Checking for updates…	Vyhledávání aktualizací…
+Couldn't check for updates: {error}	Aktualizace se nepodařilo zkontrolovat: {error}
+Downloading and verifying the update…	Stahování a ověřování aktualizace…
+No installer is available for this platform.	Pro tuto platformu není dostupný instalátor.
+Releases	Vydání
+Save your work and stop running tasks before installing an update.	Před instalací aktualizace uložte práci a zastavte běžící úlohy.
+The update failed: {error}	Aktualizace selhala: {error}
+The update worker stopped unexpectedly. Try checking again.	Proces aktualizace se neočekávaně zastavil. Zkuste kontrolu znovu.
+This installation is managed externally. Update it with its package manager or open Releases.	Tuto instalaci spravuje externí nástroj. Aktualizujte ji správcem balíčků nebo otevřete vydání.
+Update and restart	Aktualizovat a restartovat
+Update ready. Restarting…	Aktualizace je připravena. Restartování…
+Updated to {version}.	Aktualizováno na {version}.
+Use Releases or your package manager to update this installation.	Aktualizujte tuto instalaci přes vydání nebo správce balíčků.
+You're up to date.	Máte nejnovější verzi.
+{version} is available.	Je dostupná verze {version}.

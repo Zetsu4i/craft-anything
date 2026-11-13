@@ -40,19 +40,22 @@ pub fn resolve(chosen: Option<DetectTab>, providers: usize, harnesses: usize) ->
 /// Draw the two tabs and return the one that is showing. An empty tab is dimmed, not disabled: it
 /// still opens, and says what is missing.
 pub fn bar(ui: &mut egui::Ui, chosen: &mut Option<DetectTab>, detected: &[Detected]) -> DetectTab {
+    ui.horizontal_wrapped(|ui| buttons(ui, chosen, detected)).inner
+}
+
+/// Draw the tab buttons in the caller's layout, so adjacent actions share its spacing and wrapping.
+pub fn buttons(ui: &mut egui::Ui, chosen: &mut Option<DetectTab>, detected: &[Detected]) -> DetectTab {
     let (providers, harnesses) = counts(detected);
     let showing = resolve(*chosen, providers, harnesses);
-    ui.horizontal_wrapped(|ui| {
-        for (tab, label, count) in [(DetectTab::Providers, "Providers", providers), (DetectTab::Harnesses, "Harnesses", harnesses)] {
-            let mut text = egui::RichText::new(format!("{} ({count})", crate::i18n::tr(label)));
-            if count == 0 {
-                text = text.weak();
-            }
-            if ui.selectable_label(showing == tab, text).clicked() {
-                *chosen = Some(tab);
-            }
+    for (tab, label, count) in [(DetectTab::Providers, "Providers", providers), (DetectTab::Harnesses, "Harnesses", harnesses)] {
+        let mut text = egui::RichText::new(format!("{} ({count})", crate::i18n::tr(label)));
+        if count == 0 {
+            text = text.weak();
         }
-    });
+        if ui.selectable_label(showing == tab, text).clicked() {
+            *chosen = Some(tab);
+        }
+    }
     showing
 }
 

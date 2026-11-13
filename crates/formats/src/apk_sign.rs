@@ -94,6 +94,10 @@ pub struct Signer {
     /// The digests (algorithm id, raw bytes) carried inside the signed data.
     #[serde(skip)]
     pub signed_digests: Vec<(u32, Vec<u8>)>,
+    /// Required fields were incomplete or unsigned algorithm/SDK values differed from
+    /// their signed copies. Signature verification must not accept a recovered prefix.
+    #[serde(skip)]
+    pub verification_error: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -273,6 +277,12 @@ impl<'a> Lp<'a> {
         }
         out
     }
+
+    fn complete_items(data: &'a [u8]) -> Option<Vec<&'a [u8]>> {
+        let items = Self::items(data);
+        let consumed = items.iter().try_fold(0usize, |offset, item| offset.checked_add(4)?.checked_add(item.len()))?;
+        (consumed == data.len()).then_some(items)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -396,6 +406,61 @@ fn hex(b: &[u8]) -> String {
     b.iter().take(128).map(|x| format!("{x:02x}")).collect()
 }
 
+fn algorithm_ids(data: &[u8]) -> Option<Vec<u32>> {
+    let mut ids = Vec::new();
+    for item in Lp::complete_items(data)? {
+        let id = Reader::new(item).u32_le(0)?;
+        let (_, end) = (Lp { data: item }).at(4)?;
+        if end != item.len() {
+            return None;
+        }
+        ids.push(id);
+    }
+    (!ids.is_empty()).then_some(ids)
+}
+
+fn verification_fields(scheme: &str, data: &[u8]) -> Result<(), &'static str> {
+    const INCOMPLETE: &str = "the APK signer has incomplete required fields";
+    let l = Lp { data };
+    let (signed, mut pos) = l.at(0).ok_or(INCOMPLETE)?;
+    let outer_sdk = if scheme == "v2" {
+        None
+    } else {
+        let r = Reader::new(data);
+        let sdk = (r.u32_le(pos).ok_or(INCOMPLETE)?, r.u32_le(pos + 4).ok_or(INCOMPLETE)?);
+        pos += 8;
+        Some(sdk)
+    };
+    let (signatures, next) = l.at(pos).ok_or(INCOMPLETE)?;
+    let (_, end) = l.at(next).ok_or(INCOMPLETE)?;
+    if end != data.len() {
+        return Err(INCOMPLETE);
+    }
+    let sl = Lp { data: signed };
+    let (digests, next) = sl.at(0).ok_or(INCOMPLETE)?;
+    let (certificates, mut pos) = sl.at(next).ok_or(INCOMPLETE)?;
+    let certificates = Lp::complete_items(certificates).ok_or(INCOMPLETE)?;
+    if certificates.is_empty() || certificates.iter().any(|cert| cert.is_empty() || cert.len() > MAX_CERT) {
+        return Err("the APK signer's certificate list cannot be checked completely");
+    }
+    if let Some(outer) = outer_sdk {
+        let r = Reader::new(signed);
+        let inner = (r.u32_le(pos).ok_or(INCOMPLETE)?, r.u32_le(pos + 4).ok_or(INCOMPLETE)?);
+        if inner != outer {
+            return Err("the APK signer's SDK range differs from its signed copy");
+        }
+        pos += 8;
+    }
+    let (attributes, end) = sl.at(pos).ok_or(INCOMPLETE)?;
+    if end != signed.len() || Lp::complete_items(attributes).ok_or(INCOMPLETE)?.iter().any(|item| item.len() < 4) {
+        return Err(INCOMPLETE);
+    }
+    if algorithm_ids(signatures).ok_or(INCOMPLETE)? != algorithm_ids(digests).ok_or(INCOMPLETE)? {
+        return Err("the APK signature algorithm list differs from the signed digest list");
+    }
+    Ok(())
+}
+
 fn parse_signer(scheme: &'static str, s: &[u8], warnings: &mut Vec<String>) -> Option<Signer> {
     let l = Lp { data: s };
     let r = Reader::new(s);
@@ -458,6 +523,7 @@ fn parse_signer(scheme: &'static str, s: &[u8], warnings: &mut Vec<String>) -> O
         signed_data: signed.to_vec(),
         signatures,
         signed_digests,
+        verification_error: verification_fields(scheme, s).err(),
     })
 }
 

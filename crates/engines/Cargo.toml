@@ -33,5 +33,7 @@ wasmtime = { version = "49", optional = true, default-features = false, features
 wasm-plugins = ["dep:wasmtime"]
 
 [dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tempfile = "3"
 craft-anything-testkit = { workspace = true }

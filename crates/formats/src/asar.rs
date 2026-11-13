@@ -9,6 +9,8 @@ use serde_json::Value;
 
 /// Headers bigger than this are refused (real ones are a few MiB at most).
 pub const MAX_HEADER_BYTES: usize = 16 * 1024 * 1024;
+/// Total bytes retained in entry paths and rejected names after expanding directory prefixes.
+pub const MAX_PATH_BYTES: usize = 8 * 1024 * 1024;
 /// Deepest directory nesting we walk.
 pub const MAX_DEPTH: usize = 128;
 
@@ -97,11 +99,12 @@ pub fn parse(data: &[u8], max_entries: usize) -> Result<AsarArchive, AsarError> 
     let v: Value = serde_json::from_slice(json).map_err(|e| AsarError::BadJson(e.to_string()))?;
     let mut out = AsarArchive { json_bytes: json_len, data_offset: 8 + header_pickle as u64, ..Default::default() };
     let files = v.get("files").ok_or_else(|| AsarError::BadJson("no \"files\" object".into()))?;
-    walk(files, "", 0, max_entries, &mut out)?;
+    let mut remaining = MAX_PATH_BYTES;
+    walk(files, "", 0, max_entries, &mut remaining, &mut out)?;
     Ok(out)
 }
 
-fn walk(files: &Value, prefix: &str, depth: usize, max: usize, out: &mut AsarArchive) -> Result<(), AsarError> {
+fn walk(files: &Value, prefix: &str, depth: usize, max: usize, remaining: &mut usize, out: &mut AsarArchive) -> Result<(), AsarError> {
     let map = files.as_object().ok_or_else(|| AsarError::BadJson(format!("files at {prefix:?} is not an object")))?;
     if depth > MAX_DEPTH {
         out.truncated = true;
@@ -112,11 +115,18 @@ fn walk(files: &Value, prefix: &str, depth: usize, max: usize, out: &mut AsarArc
             out.truncated = true;
             return Ok(());
         }
+        // A compact tree can repeat one long directory prefix in thousands of paths. Charge
+        // the complete expanded identity before allocating it, including rejected names.
+        let Some(bytes) = prefix.len().checked_add(name.len()).filter(|bytes| *bytes <= *remaining) else {
+            out.truncated = true;
+            return Ok(());
+        };
+        *remaining -= bytes;
+        let path = format!("{prefix}{name}");
         if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') || name.contains('\0') {
-            out.rejected_names.push(format!("{prefix}{name}"));
+            out.rejected_names.push(path);
             continue;
         }
-        let path = format!("{prefix}{name}");
         if !node.is_object() {
             return Err(AsarError::BadJson(format!("node at {path:?} is not an object")));
         }
@@ -134,7 +144,7 @@ fn walk(files: &Value, prefix: &str, depth: usize, max: usize, out: &mut AsarArc
                 link: None,
                 integrity: None,
             });
-            walk(children, &format!("{path}/"), depth + 1, max, out)?;
+            walk(children, &format!("{path}/"), depth + 1, max, remaining, out)?;
         } else if let Some(link) = node.get("link") {
             let link = link.as_str().ok_or_else(|| AsarError::BadJson(format!("link at {path:?} is not a string")))?;
             out.entries.push(AsarEntry {
@@ -241,7 +251,8 @@ mod tests {
     fn invalid_names_consume_the_listing_budget() {
         let files = serde_json::json!({"../a": {}, "../b": {}, "ok": {"size": 0, "offset": "0"}});
         let mut archive = AsarArchive::default();
-        walk(&files, "", 0, 1, &mut archive).unwrap();
+        let mut remaining = MAX_PATH_BYTES;
+        walk(&files, "", 0, 1, &mut remaining, &mut archive).unwrap();
         assert_eq!(archive.rejected_names.len(), 1);
         assert!(archive.entries.is_empty());
         assert!(archive.truncated);

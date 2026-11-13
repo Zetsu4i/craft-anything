@@ -66,7 +66,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ToolSpec {
             id: "app_call_path_find",
             title: "Find a call path",
-            summary: "Find a path of calls from a start address to a goal address over a call graph assembled from native_function_study evidence records.",
+            summary: "Find a path of calls from a start address to a goal address over a call graph assembled from native_function_study evidence records for the same input binary.",
             beginner: "Find how one function reaches another through the calls between them.",
             toolset: Application,
             effects: Effects::EVIDENCE,
@@ -296,11 +296,10 @@ fn core_evidence_exports_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<Too
     let left = load_bundle(&p.older_bundle)?;
     let right = load_bundle(&p.newer_bundle)?;
 
-    // Match records by (operation, subject sha256 + name). A matched pair is "changed" when its
-    // evidence id differs (the id is the content hash), "unchanged" otherwise.
+    // Match within (operation, subject) groups without discarding repeated observations.
+    // Verified equal ids cancel first; remaining records form deterministic changed pairs.
     let lmap = bundle_index(&left);
     let rmap = bundle_index(&right);
-    let integrity_of = |m: &Value| m.get("integrity").and_then(Value::as_str).unwrap_or("unverifiable").to_string();
     // Records that fail their own id, or can't be read as evidence, on either side.
     let mut failing = Vec::new();
     for (side, recs) in [("left", &left), ("right", &right)] {
@@ -321,28 +320,35 @@ fn core_evidence_exports_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<Too
     let mut changed = Vec::new();
     let mut unchanged = 0usize;
     let mut pairs = Vec::new();
-    for (key, (lid, lmeta)) in &lmap {
-        match rmap.get(key) {
-            None => removed.push(json!({"key": key, "evidence_id": lid})),
-            Some((rid, rmeta)) => {
-                let (li, ri) = (integrity_of(lmeta), integrity_of(rmeta));
-                if li == "tampered" || ri == "tampered" {
-                    // Equal ids prove nothing when a record doesn't match its own id.
-                    changed.push(json!({"key": key, "left": lid, "right": rid, "reason": "integrity", "left_integrity": li, "right_integrity": ri}));
-                } else if lid == rid {
-                    unchanged += 1;
-                } else {
-                    changed.push(json!({"key": key, "left": lid, "right": rid}));
+    for (key, lrecords) in &lmap {
+        let rrecords = rmap.get(key).map(Vec::as_slice).unwrap_or_default();
+        for (lrecord, rrecord) in bundle_pairs(lrecords, rrecords) {
+            match (lrecord, rrecord) {
+                (Some((lid, _)), None) => removed.push(json!({"key": key, "evidence_id": lid})),
+                (None, Some((rid, _))) => added.push(json!({"key": key, "evidence_id": rid})),
+                (Some((lid, lmeta)), Some((rid, rmeta))) => {
+                    let (li, ri) = (integrity_of(lmeta), integrity_of(rmeta));
+                    if li != "verified" || ri != "verified" {
+                        // Equal stored ids prove nothing unless both records match their ids.
+                        changed.push(json!({"key": key, "left": lid, "right": rid, "reason": "integrity", "left_integrity": li, "right_integrity": ri}));
+                    } else if lid == rid {
+                        unchanged += 1;
+                    } else {
+                        changed.push(json!({"key": key, "left": lid, "right": rid}));
+                    }
+                    if p.keep_pairs {
+                        pairs.push(json!({"key": key, "left": lid, "right": rid}));
+                    }
                 }
-                if p.keep_pairs {
-                    pairs.push(json!({"key": key, "left": lid, "right": rid}));
-                }
+                (None, None) => {}
             }
         }
     }
-    for (key, (rid, _)) in &rmap {
+    for (key, rrecords) in &rmap {
         if !lmap.contains_key(key) {
-            added.push(json!({"key": key, "evidence_id": rid}));
+            for (rid, _) in rrecords {
+                added.push(json!({"key": key, "evidence_id": rid}));
+            }
         }
     }
 
@@ -385,11 +391,7 @@ type Rec = (String, Value);
 
 fn load_bundle(path: &str) -> Result<Vec<Rec>, ToolError> {
     let pb = super::artifact_tools::abs_path(path, "bundle path")?;
-    let meta = std::fs::metadata(&pb).map_err(|e| ToolError::io(pb.display(), e))?;
-    if meta.len() > 512 * 1024 * 1024 {
-        return Err(ToolError::new(craft_anything_evidence::ErrorCode::OverLimit, "bundle is too large"));
-    }
-    let bytes = std::fs::read(&pb).map_err(|e| ToolError::io(pb.display(), e))?;
+    let bytes = craft_anything_platform::fs::read_file_capped(&pb, 512 * 1024 * 1024)?;
     let v: Value = serde_json::from_slice(&bytes).map_err(|e| ToolError::invalid(format!("not a bundle: {e}")))?;
     if v.get("format").and_then(Value::as_str) != Some(super::session_tools::BUNDLE_FORMAT) {
         return Err(ToolError::invalid(format!("{path} is not a Craft Anything evidence bundle")));
@@ -417,13 +419,59 @@ fn subject_key(subject: &Value) -> String {
     format!("{kind}:{sha}:{name}")
 }
 
-fn bundle_index(recs: &[Rec]) -> BTreeMap<String, (String, Value)> {
-    let mut m = BTreeMap::new();
+type IndexedRec<'a> = (&'a str, &'a Value);
+type BundleIndex<'a> = BTreeMap<&'a str, Vec<IndexedRec<'a>>>;
+type RecordPair<'a> = (Option<IndexedRec<'a>>, Option<IndexedRec<'a>>);
+
+fn integrity_of(meta: &Value) -> &str {
+    meta.get("integrity").and_then(Value::as_str).unwrap_or("unverifiable")
+}
+
+fn bundle_index(recs: &[Rec]) -> BundleIndex<'_> {
+    let mut m = BundleIndex::new();
     for (key, meta) in recs {
-        let id = meta.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-        m.insert(key.clone(), (id, meta.clone()));
+        let id = meta.get("id").and_then(Value::as_str).unwrap_or("");
+        m.entry(key).or_default().push((id, meta));
+    }
+    for records in m.values_mut() {
+        records.sort_unstable_by(|a, b| {
+            let (ai, bi) = (integrity_of(a.1), integrity_of(b.1));
+            a.0.cmp(b.0).then_with(|| (ai != "verified").cmp(&(bi != "verified"))).then_with(|| ai.cmp(bi))
+        });
     }
     m
+}
+
+/// Each sorted group is a multiset: preserve duplicate counts and match equal ids before
+/// pairing remaining versions. Verified copies sort first within an id, so an altered copy
+/// cannot consume a verified match. Sorting is O(n log n); this merge is linear.
+fn bundle_pairs<'a>(left: &[IndexedRec<'a>], right: &[IndexedRec<'a>]) -> Vec<RecordPair<'a>> {
+    let mut pairs = Vec::new();
+    let (mut li, mut ri) = (0, 0);
+    let (mut lrest, mut rrest) = (Vec::new(), Vec::new());
+    while li < left.len() && ri < right.len() {
+        match left[li].0.cmp(right[ri].0) {
+            std::cmp::Ordering::Equal => {
+                pairs.push((Some(left[li]), Some(right[ri])));
+                li += 1;
+                ri += 1;
+            }
+            std::cmp::Ordering::Less => {
+                lrest.push(left[li]);
+                li += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                rrest.push(right[ri]);
+                ri += 1;
+            }
+        }
+    }
+    lrest.extend_from_slice(&left[li..]);
+    rrest.extend_from_slice(&right[ri..]);
+    for i in 0..lrest.len().max(rrest.len()) {
+        pairs.push((lrest.get(i).copied(), rrest.get(i).copied()));
+    }
+    pairs
 }
 
 // --------------------------------------------------------------------------------------------
@@ -500,7 +548,7 @@ fn comparison_is_changed(result: &Value) -> bool {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CallPathParams {
-    /// native_function_study evidence records that describe the functions and their callees.
+    /// native_function_study evidence records from the same input binary, describing its functions and callees.
     pub functions: Vec<Value>,
     /// Start address (0x-hex or decimal).
     pub start: String,
@@ -527,8 +575,22 @@ fn app_call_path_find(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
     let mut adj: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
     let mut names: BTreeMap<u64, String> = BTreeMap::new();
     let mut links = Vec::new();
+    let mut input_sha: Option<String> = None;
     for f in &p.functions {
         let ev = resolve_evidence_input(ctx, f, &["native_function_study"])?;
+        // Addresses belong to an input binary; equal addresses in other files are unrelated nodes.
+        let sha = ev.subject.sha256.as_deref().filter(|sha| !sha.is_empty()).ok_or_else(|| {
+            ToolError::invalid("a function study has no input content hash")
+                .with_remediation("Collect function studies with native_function_study before finding a call path.")
+        })?;
+        match input_sha.as_deref() {
+            Some(expected) if expected != sha => {
+                return Err(ToolError::invalid("function studies refer to different input binaries")
+                    .with_remediation("Pass function studies from a single program version."));
+            }
+            None => input_sha = Some(sha.to_string()),
+            _ => {}
+        }
         links.push(ev.id.clone());
         let proc = ev.result.get("function");
         let entry = proc.and_then(|p| p.get("entry")).and_then(Value::as_str).and_then(|h| super::parse_address(h).ok());

@@ -184,7 +184,7 @@ pub struct RowPage {
     pub rows: Vec<Row>,
     /// Rows skipped before the page (the requested offset, clamped to what exists).
     pub offset: usize,
-    /// True when reading stopped at the row cap or a budget and more rows may exist.
+    /// True when a row cap, budget or unreadable part of the tree may have hidden more rows.
     pub truncated: bool,
     /// Non-fatal observations (corruption skipped, overflow capped, …).
     pub notes: Vec<String>,
@@ -198,16 +198,20 @@ pub struct RowCount {
     pub bounded: bool,
 }
 
-/// Accumulator for a bounded b-tree row walk: the rows gathered so far, a visited-page set to
-/// stop cycles, the remaining page-walk budget, how many rows are wanted, and any notes.
+/// Accumulator for a bounded b-tree row walk: retained rows, a visited-page set to stop cycles,
+/// the remaining page-walk budget, the requested row range, and any notes.
 struct RowWalk {
     index_tree: bool,
     visited: BTreeSet<u32>,
     budget: usize,
     out: Vec<Row>,
     notes: Vec<String>,
-    /// Stop once this many rows are collected (0 = no limit, used for the schema walk).
+    incomplete: bool,
+    /// Stop once this many readable rows have been consumed, including skipped rows.
     want: usize,
+    seen: usize,
+    /// Decode but immediately discard rows before this offset.
+    skip: usize,
     /// Longest text value decoded whole, and the whole text still allowed above [`MAX_TEXT`].
     text_cap: usize,
     text_budget: usize,
@@ -221,15 +225,22 @@ impl RowWalk {
             budget: MAX_PAGES_WALKED,
             out: Vec::new(),
             notes: Vec::new(),
+            incomplete: false,
             want,
+            seen: 0,
+            skip: 0,
             text_cap: MAX_TEXT,
             text_budget: 0,
         }
     }
 
-    /// Keep a row. While text past [`MAX_TEXT`] is read, the row's text spends the budget; once it
-    /// is spent, later rows are cut at [`MAX_TEXT`].
+    /// Count a readable row, retaining it only after the requested offset. While text past
+    /// [`MAX_TEXT`] is retained, it spends the budget; later rows are cut once the budget is spent.
     fn keep(&mut self, row: Row) {
+        self.seen = self.seen.saturating_add(1);
+        if self.seen <= self.skip {
+            return;
+        }
         if self.text_cap > MAX_TEXT {
             let text: usize = row.values.iter().map(|value| if let CellValue::Text { text, .. } = value { text.len() } else { 0 }).sum();
             self.text_budget = self.text_budget.saturating_sub(text);
@@ -499,9 +510,10 @@ impl<'a> SqliteDb<'a> {
     /// Read a page of rows from the table rooted at `rootpage`.
     pub fn read_rows(&self, rootpage: u32, offset: usize, limit: usize) -> RowPage {
         let limit = limit.min(MAX_ROWS);
-        // Collect offset+limit rows, then drop the leading `offset`.
+        // Consume offset+limit readable rows, retaining only the requested page.
         let want = offset.saturating_add(limit);
         let mut w = RowWalk::new(want);
+        w.skip = offset;
         let table = self.without_rowid_table(rootpage);
         w.index_tree = table.is_some();
         self.collect_table_rows(&mut w, rootpage, 0);
@@ -526,9 +538,9 @@ impl<'a> SqliteDb<'a> {
                 w.notes.push("Could not determine the primary-key column order; values remain in storage order.".into());
             }
         }
-        let hit_cap = w.out.len() >= want && want > 0;
-        let skipped = offset.min(w.out.len());
-        let mut page: Vec<Row> = w.out.into_iter().skip(offset).take(limit).collect();
+        let hit_cap = w.seen >= want && want > 0;
+        let skipped = offset.min(w.seen);
+        let mut page = w.out;
         let (schema, _) = self.whole_schema();
         if let Some(table) = schema.iter().find(|o| o.obj_type == "table" && o.rootpage == rootpage) {
             let definitions = column_definitions(&table.sql);
@@ -585,7 +597,7 @@ impl<'a> SqliteDb<'a> {
                 }
             }
         }
-        RowPage { rows: page, offset: skipped, truncated: hit_cap, notes: w.notes }
+        RowPage { rows: page, offset: skipped, truncated: hit_cap || w.incomplete, notes: w.notes }
     }
 
     /// Recursively count rows. Returns false when a budget or an unreadable page/child stopped the walk.
@@ -594,7 +606,7 @@ impl<'a> SqliteDb<'a> {
             return false;
         }
         if pageno == 0 || !visited.insert(pageno) {
-            return true; // a cycle or a null pointer: stop, but not a budget failure.
+            return false; // A repeated or null child cannot establish a complete count.
         }
         *budget -= 1;
         let Some(page) = self.btree_page(pageno) else { return false };
@@ -630,20 +642,32 @@ impl<'a> SqliteDb<'a> {
                 }
                 ok
             }
-            _ => true, // not a table page; ignore.
+            _ => false, // A child must belong to the same kind of b-tree as its root.
         }
     }
 
-    /// Recursively gather rows in key order, stopping once `want` are collected.
+    /// Recursively read rows in key order, stopping once `want` readable rows are consumed.
     fn collect_table_rows(&self, w: &mut RowWalk, pageno: u32, depth: usize) {
-        if depth > MAX_DEPTH || w.budget == 0 || (w.want != 0 && w.out.len() >= w.want) {
+        if w.seen >= w.want {
+            return;
+        }
+        if depth > MAX_DEPTH || w.budget == 0 {
+            if !w.incomplete {
+                w.notes.push(format!("Stopped before b-tree page {pageno}: page or depth budget exhausted."));
+            }
+            w.incomplete = true;
             return;
         }
         if pageno == 0 || !w.visited.insert(pageno) {
+            if !w.incomplete {
+                w.notes.push(format!("Skipped a null or repeated b-tree child page {pageno}."));
+            }
+            w.incomplete = true;
             return;
         }
         w.budget -= 1;
         let Some(page) = self.btree_page(pageno) else {
+            w.incomplete = true;
             w.notes.push(format!("Skipped an unreadable b-tree page {pageno}."));
             return;
         };
@@ -652,7 +676,7 @@ impl<'a> SqliteDb<'a> {
         match ptype {
             0x0d | 0x0a if (ptype == 0x0a) == w.index_tree => {
                 for i in 0..ncells {
-                    if w.want != 0 && w.out.len() >= w.want {
+                    if w.seen >= w.want {
                         return;
                     }
                     let row = page.cell_offset(i).and_then(|cell_off| {
@@ -664,22 +688,33 @@ impl<'a> SqliteDb<'a> {
                     });
                     match row {
                         Some(row) => w.keep(row),
-                        None => w.notes.push(format!("Skipped an unreadable row on page {pageno}.")),
+                        None => {
+                            w.incomplete = true;
+                            w.notes.push(format!("Skipped an unreadable row on page {pageno}."));
+                        }
                     }
                 }
             }
             0x05 | 0x02 if (ptype == 0x02) == w.index_tree => {
                 for i in 0..ncells {
-                    if (w.want != 0 && w.out.len() >= w.want) || w.budget == 0 {
+                    if w.seen >= w.want {
+                        return;
+                    }
+                    if w.budget == 0 {
+                        if !w.incomplete {
+                            w.notes.push(format!("Stopped within b-tree page {pageno}: page budget exhausted."));
+                        }
+                        w.incomplete = true;
                         return;
                     }
                     if let Some(child) = Self::interior_child(&page, i) {
                         self.collect_table_rows(w, child, depth + 1);
                     } else {
+                        w.incomplete = true;
                         w.notes.push(format!("Skipped an unreadable child pointer on page {pageno}."));
                     }
                     if w.index_tree {
-                        if w.want != 0 && w.out.len() >= w.want {
+                        if w.seen >= w.want {
                             return;
                         }
                         let row = page
@@ -688,7 +723,10 @@ impl<'a> SqliteDb<'a> {
                             .and_then(|off| self.read_index_cell(page.data, off, w.text_cap, &mut w.notes));
                         match row {
                             Some(row) => w.keep(row),
-                            None => w.notes.push(format!("Skipped an unreadable row on page {pageno}.")),
+                            None => {
+                                w.incomplete = true;
+                                w.notes.push(format!("Skipped an unreadable row on page {pageno}."));
+                            }
                         }
                     }
                 }
@@ -696,7 +734,12 @@ impl<'a> SqliteDb<'a> {
                     self.collect_table_rows(w, right, depth + 1);
                 }
             }
-            _ => {}
+            _ => {
+                if !w.incomplete {
+                    w.notes.push(format!("Skipped b-tree page {pageno}: its page kind does not match the root."));
+                }
+                w.incomplete = true;
+            }
         }
     }
 
@@ -1687,7 +1730,7 @@ fn take_identifier(seg: &str) -> (String, &str) {
             (seg.get(1..).unwrap_or("").to_string(), "")
         }
         Some(_) => {
-            let endp = seg.find([' ', '\t', '\n', '(', ',']).unwrap_or(seg.len());
+            let endp = seg.find([' ', '\t', '\n', '\r', '\u{c}', '(', ',']).unwrap_or(seg.len());
             // A comment may follow the name with no space between: `id/*key*/` or `id--key`.
             let endp = ["--", "/*"].into_iter().filter_map(|mark| seg.get(..endp)?.find(mark)).fold(endp, usize::min);
             (seg.get(..endp).unwrap_or("").to_string(), seg.get(endp..).unwrap_or(""))
@@ -1794,7 +1837,7 @@ mod tests {
     /// the usual cap. Text shown to the reader is cut at the cap on a character boundary.
     #[test]
     fn whole_schema_text_stops_when_its_budget_is_spent() {
-        let mut w = RowWalk::new(0);
+        let mut w = RowWalk::new(2);
         w.text_cap = MAX_SCHEMA_TEXT;
         w.text_budget = 10;
         w.keep(Row { rowid: Some(1), values: vec![text("1234"), CellValue::Int(5)] });

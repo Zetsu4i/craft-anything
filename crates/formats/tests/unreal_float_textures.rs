@@ -27,7 +27,7 @@ fn cooked_half_and_full_precision_formats_reach_the_pixel_decoder() {
     }
     assert_eq!(unreal_texture::layout("PF_R16F_FILTER"), Some(Layout::RHalf));
     assert_eq!(unreal_texture::layout("PF_G16R16F_FILTER"), Some(Layout::RgHalf));
-    assert_eq!(unreal_texture::layout("PF_FloatR11G11B10"), None);
+    assert_eq!(unreal_texture::layout("PF_FloatR11G11B10"), Some(pixels::Layout::Rgb111110Float));
 }
 
 #[test]

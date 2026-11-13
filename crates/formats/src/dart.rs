@@ -495,8 +495,8 @@ fn uri_char(b: u8) -> bool {
 /// Scan bytes for `package:`/`dart:` URIs and identifier tokens.
 pub fn string_pool(data: &[u8], max_uris: usize, max_tokens: usize) -> StringPool {
     let mut pool = StringPool { scanned_bytes: data.len() as u64, ..StringPool::default() };
-    let mut seen_uri = HashSet::new();
-    let mut seen_tok = HashSet::new();
+    let mut seen_uri: HashSet<&[u8]> = HashSet::new();
+    let mut seen_tok: HashSet<&[u8]> = HashSet::new();
     let mut i = 0usize;
     let n = data.len();
     while i < n {
@@ -524,10 +524,11 @@ pub fn string_pool(data: &[u8], max_uris: usize, max_tokens: usize) -> StringPoo
                 let body_ok = run.get(at + prefix.len()).is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_');
                 if body_ok && end - at <= 512 {
                     has_uri = true;
-                    let u = String::from_utf8_lossy(run.get(at..end).unwrap_or_default()).into_owned();
-                    if seen_uri.insert(u.clone()) {
+                    let u = run.get(at..end).unwrap_or_default();
+                    if !seen_uri.contains(u) {
                         if pool.uris.len() < max_uris {
-                            pool.uris.push(u);
+                            seen_uri.insert(u);
+                            pool.uris.push(String::from_utf8_lossy(u).into_owned());
                         } else {
                             pool.uris_truncated = true;
                         }
@@ -548,10 +549,10 @@ pub fn string_pool(data: &[u8], max_uris: usize, max_tokens: usize) -> StringPoo
             if letters * 2 < tok.len() {
                 continue;
             }
-            let t = String::from_utf8_lossy(tok).into_owned();
-            if seen_tok.insert(t.clone()) {
+            if !seen_tok.contains(tok) {
                 if pool.tokens.len() < max_tokens {
-                    pool.tokens.push(t);
+                    seen_tok.insert(tok);
+                    pool.tokens.push(String::from_utf8_lossy(tok).into_owned());
                 } else {
                     pool.tokens_truncated = true;
                 }

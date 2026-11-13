@@ -28,6 +28,7 @@ pub mod providers;
 pub mod rebuild;
 pub mod sandbox;
 pub mod ssh;
+pub mod window;
 
 pub use cli_agents::models::{AgentModel, ModelContext};
 pub use config::{AiConfig, BackendEntry, BackendOptions, Price};
@@ -405,6 +406,10 @@ impl ChatModel for Tunneled {
 
     fn model(&self) -> String {
         self.inner.model()
+    }
+
+    fn context_window(&self) -> Option<window::Window> {
+        self.inner.context_window()
     }
 }
 
@@ -1081,6 +1086,8 @@ impl AiHub {
                 let key = self.keys.get(&c.name).or_else(|| go_env_key(base).or_else(|| providers::env_key(base)));
                 let mut o = compatible_client(&c.name, base, key, &c.model, &self.session_id());
                 o.react = e.options.react_fallback.unwrap_or(false);
+                o.asks_window = true;
+                o.on_this_network = local;
                 with_limit(o)
             }
             BackendKind::AgentCli => return Err(ToolError::invalid(format!("{} is an agent app, not an API backend.", c.name))),

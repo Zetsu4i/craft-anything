@@ -101,12 +101,24 @@ fn mock(responses: Vec<(u16, &'static str, String)>) -> (String, Arc<Mutex<Vec<S
     let seen = Arc::new(Mutex::new(Vec::new()));
     let s2 = seen.clone();
     std::thread::spawn(move || {
-        for (status, ctype, reply) in responses {
+        let mut responses = responses.into_iter().peekable();
+        while let Some((next_status, next_type, _)) = responses.peek() {
+            let lists_next = *next_status == 200 && *next_type == "application/json";
             let Ok((stream, _)) = l.accept() else { return };
             let mut r = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
             r.read_line(&mut line).unwrap();
             let path = line.split_whitespace().nth(1).unwrap_or_default().to_string();
+            // Scripted questions are model lists answered with a list. Any other question is a
+            // window probe (crate::window) the test didn't script: say nothing, as a server that
+            // doesn't report its window does, and keep the scripted answer for the request after.
+            if line.starts_with("GET ") && !(lists_next && path.ends_with("/models")) {
+                let mut w = stream;
+                write!(w, "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+                w.flush().unwrap();
+                continue;
+            }
+            let Some((status, ctype, reply)) = responses.next() else { return };
             let mut headers = Vec::new();
             let mut len = 0usize;
             loop {
@@ -404,7 +416,7 @@ fn opencode_selection_is_validated_saved_and_run_natively_with_our_mcp_server() 
     let seen = dir.path().join("arguments.txt");
     let quote = |p: &std::path::Path| ssh::shell_quote(&p.display().to_string());
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\napi) cat {};;\nrun) printf '%s\\n' \"$@\" > {}; cat \"$OPENCODE_CONFIG\" >> {}; printf 'done';;\n*) exit 8;;\nesac\n",
+        "#!/bin/sh\ncase \"$1\" in\napi) cat {};;\nrun) if [ \"$2\" = '--help' ]; then printf '%s\\n' '--format --standalone'; exit 0; fi; printf '%s\\n' \"$@\" > {}; cat \"$OPENCODE_CONFIG\" >> {}; printf 'done';;\n*) exit 8;;\nesac\n",
         quote(&catalogue),
         quote(&seen),
         quote(&seen)

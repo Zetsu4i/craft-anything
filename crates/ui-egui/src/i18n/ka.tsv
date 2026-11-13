@@ -1467,3 +1467,24 @@ Connecting to {name}… {seconds} s	{name}-თან დაკავშირე
 Stopped adding {name}.	{name}-ის დამატება შეჩერდა.
 It isn't there any more, so {program} runs in its place.	ის აღარ არის იქ, ამიტომ მის ნაცვლად {program} ეშვება.
 Use it	გამოყენება
+
+# Native update checks and verified installation.
+ArtCraft Launcher manages this app's version. Change its version there.	ამ აპის ვერსიას ArtCraft Launcher მართავს. ვერსია იქ შეცვალეთ.
+Check again	ხელახლა შემოწმება
+Check for Updates	განახლებების შემოწმება
+Check for Updates…	განახლებების შემოწმება…
+Checking for updates…	მიმდინარეობს განახლებების შემოწმება…
+Couldn't check for updates: {error}	განახლებების შემოწმება ვერ მოხერხდა: {error}
+Downloading and verifying the update…	მიმდინარეობს განახლების ჩამოტვირთვა და შემოწმება…
+No installer is available for this platform.	ამ პლატფორმისთვის დამყენებელი ხელმისაწვდომი არ არის.
+Releases	გამოშვებები
+Save your work and stop running tasks before installing an update.	განახლების დაყენებამდე შეინახეთ ნამუშევარი და შეაჩერეთ მიმდინარე ამოცანები.
+The update failed: {error}	განახლება ვერ მოხერხდა: {error}
+The update worker stopped unexpectedly. Try checking again.	განახლების პროცესი მოულოდნელად შეწყდა. სცადეთ ხელახლა შემოწმება.
+This installation is managed externally. Update it with its package manager or open Releases.	ეს ინსტალაცია გარედან იმართება. განაახლეთ პაკეტების მმართველით ან გახსენით გამოშვებები.
+Update and restart	განახლება და ხელახლა გაშვება
+Update ready. Restarting…	განახლება მზადაა. მიმდინარეობს ხელახლა გაშვება…
+Updated to {version}.	განახლდა {version} ვერსიამდე.
+Use Releases or your package manager to update this installation.	ამ ინსტალაციის გასაახლებლად გამოიყენეთ გამოშვებები ან პაკეტების მმართველი.
+You're up to date.	უახლეს ვერსიას იყენებთ.
+{version} is available.	ხელმისაწვდომია {version}.

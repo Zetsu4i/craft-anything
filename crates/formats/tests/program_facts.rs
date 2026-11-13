@@ -144,6 +144,7 @@ fn a_descriptor_loop_hits_the_row_cap() {
     d[sh + 16..sh + 20].copy_from_slice(&(extra.len() as u32).to_le_bytes());
     d[sh + 20..sh + 24].copy_from_slice(&extra_raw.to_le_bytes());
     // Fill .facts with descriptors that all use it (0x800 / 20 = 102 of them, 408,000 rows wanted).
+    set_dir(&mut d, 1, 0x6000, 102 * 20); // All descriptors belong to the declared import directory.
     let name = 0x6300u32;
     for i in 0..102 {
         let o = start + i * 20;

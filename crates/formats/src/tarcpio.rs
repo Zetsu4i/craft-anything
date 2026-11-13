@@ -1,9 +1,10 @@
 //! Member walkers for Unix archives: tar (v7, ustar, GNU long names and base-256 sizes, pax path
-//! overrides) and cpio (newc, crc and portable odc). They list members and where their data
+//! local/global overrides) and cpio (newc, crc and portable odc). They list members and where their data
 //! lies; nothing is extracted here, and no input can make them panic or loop forever.
 
 use crate::bytes::Reader;
 use serde::Serialize;
+use std::collections::BTreeSet;
 
 /// What a member is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -31,12 +32,13 @@ pub struct Member {
     pub mode: u32,
 }
 
-/// Why GNU tar name metadata stopped a walk that still retains earlier members.
+/// Why tar name metadata stopped a walk that still retains earlier members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     GnuMetadataTooLong,
     GnuMetadataTruncated,
+    GlobalNameBudget,
 }
 
 /// The members of an archive.
@@ -51,7 +53,7 @@ pub struct Listing {
     pub complete: bool,
     /// True when `max_members` stopped the walk.
     pub truncated: bool,
-    /// GNU metadata that prevented reading the remaining member identities.
+    /// Name metadata that prevented reading the remaining member identities.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<StopReason>,
     pub warnings: Vec<String>,
@@ -59,6 +61,7 @@ pub struct Listing {
 
 const BLOCK: usize = 512;
 const MAX_NAME: usize = 4096;
+const MAX_GLOBAL_NAME_COPIES: usize = 64 << 20;
 
 fn trim_field(f: &[u8]) -> &[u8] {
     let end = f.iter().position(|&b| b == 0).unwrap_or(f.len());
@@ -118,6 +121,10 @@ fn round_up(v: u64, to: u64) -> Option<u64> {
 
 /// Walk a tar archive. `None` when the first block is not a valid header.
 pub fn tar(data: &[u8], max_members: usize) -> Option<Listing> {
+    tar_with_name_copy_limit(data, max_members, MAX_GLOBAL_NAME_COPIES)
+}
+
+fn tar_with_name_copy_limit(data: &[u8], max_members: usize, mut name_bytes_left: usize) -> Option<Listing> {
     let r = Reader::new(data);
     if !tar_header_ok(r.slice(0, BLOCK)?) {
         return None;
@@ -130,6 +137,11 @@ pub fn tar(data: &[u8], max_members: usize) -> Option<Listing> {
     let mut pax_link: Option<String> = None;
     let mut pax_size: Option<u64> = None;
     let mut pax_sparse = false;
+    let mut global_path: Option<String> = None;
+    let mut global_link: Option<String> = None;
+    let mut global_size: Option<u64> = None;
+    // Borrow keys from the input: global sparse attributes persist until their own deletion.
+    let mut global_sparse: BTreeSet<&[u8]> = BTreeSet::new();
     // Every iteration advances by at least one block, so the walk is bounded by the input size.
     'headers: loop {
         let Some(h) = r.slice(pos, BLOCK) else {
@@ -156,7 +168,7 @@ pub fn tar(data: &[u8], max_members: usize) -> Option<Listing> {
             break;
         };
         if !matches!(typeflag, b'x' | b'g' | b'L' | b'K')
-            && let Some(s) = pax_size.take()
+            && let Some(s) = pax_size.take().or(global_size)
         {
             size = s;
         }
@@ -192,7 +204,8 @@ pub fn tar(data: &[u8], max_members: usize) -> Option<Listing> {
                     long_link = value;
                 }
             }
-            b'x' => {
+            b'x' | b'g' => {
+                let global = typeflag == b'g';
                 if let Some(mut remaining) = body {
                     for _ in 0..256 {
                         if remaining.is_empty() {
@@ -204,7 +217,15 @@ pub fn tar(data: &[u8], max_members: usize) -> Option<Listing> {
                             break 'headers;
                         };
                         if key.starts_with(b"GNU.sparse.") {
-                            pax_sparse = true;
+                            if global {
+                                if value.is_empty() {
+                                    global_sparse.remove(key);
+                                } else {
+                                    global_sparse.insert(key);
+                                }
+                            } else {
+                                pax_sparse = true;
+                            }
                         }
                         match key {
                             b"path" | b"linkpath" | b"GNU.sparse.name" => {
@@ -213,10 +234,28 @@ pub fn tar(data: &[u8], max_members: usize) -> Option<Listing> {
                                     out.length = pos as u64;
                                     break 'headers;
                                 }
-                                let slot = if key == b"linkpath" { &mut pax_link } else { &mut pax_path };
-                                *slot = Some(String::from_utf8_lossy(value).into_owned());
+                                let slot = match (global, key == b"linkpath") {
+                                    (true, true) => &mut global_link,
+                                    (true, false) => &mut global_path,
+                                    (false, true) => &mut pax_link,
+                                    (false, false) => &mut pax_path,
+                                };
+                                *slot = if global && value.is_empty() { None } else { Some(String::from_utf8_lossy(value).into_owned()) };
                             }
-                            b"size" => pax_size = std::str::from_utf8(value).ok().and_then(|s| s.parse().ok()),
+                            b"size" => {
+                                let size = std::str::from_utf8(value).ok().and_then(|s| s.parse().ok());
+                                if !value.is_empty() && (size.is_none() || !value.iter().all(u8::is_ascii_digit)) {
+                                    let scope = if global { "global" } else { "local" };
+                                    out.warnings.push(format!("invalid {scope} pax size at {pos:#x}"));
+                                    out.length = pos as u64;
+                                    break 'headers;
+                                }
+                                if global {
+                                    global_size = size;
+                                } else {
+                                    pax_size = size;
+                                }
+                            }
                             _ => {}
                         }
                         remaining = rest;
@@ -228,15 +267,38 @@ pub fn tar(data: &[u8], max_members: usize) -> Option<Listing> {
                     }
                 }
             }
-            b'g' => {}
             _ => {
+                if out.members.len() >= max_members {
+                    out.truncated = true;
+                    out.length = pos as u64;
+                    break;
+                }
+                let linked = matches!(typeflag, b'1' | b'2');
+                let copied_path = if pax_path.is_none() { global_path.as_ref().map_or(0, String::len) } else { 0 };
+                let copied_link = if linked && pax_link.is_none() { global_link.as_ref().map_or(0, String::len) } else { 0 };
+                let Some(remaining) = name_bytes_left.checked_sub(copied_path.saturating_add(copied_link)) else {
+                    out.stop_reason = Some(StopReason::GlobalNameBudget);
+                    out.warnings.push("the retained global pax name-byte budget was reached; later members were omitted".into());
+                    out.length = pos as u64;
+                    break;
+                };
+                name_bytes_left = remaining;
                 // Old GNU headers use these bytes for timestamps and sparse-file metadata.
                 let ustar = h.get(257..263) == Some(b"ustar\0");
                 let base = text(h.get(0..100).unwrap_or(&[]));
                 let prefix = if ustar { text(h.get(345..500).unwrap_or(&[])) } else { String::new() };
                 let joined = if prefix.is_empty() { base } else { format!("{prefix}/{base}") };
-                let name = pax_path.take().or(long_name.take()).unwrap_or(joined);
-                let link = pax_link.take().or(long_link.take()).or_else(|| Some(text(h.get(157..257).unwrap_or(&[])))).filter(|l| !l.is_empty());
+                // PAX values override header names, including GNU's long-name replacement.
+                // Consume the one-member GNU records even when a PAX value takes precedence.
+                let gnu_name = long_name.take();
+                let gnu_link = long_link.take();
+                let name = pax_path.take().or_else(|| global_path.clone()).or(gnu_name).unwrap_or(joined);
+                let link = pax_link
+                    .take()
+                    .or_else(|| if linked { global_link.clone() } else { None })
+                    .or(gnu_link)
+                    .or_else(|| Some(text(h.get(157..257).unwrap_or(&[]))))
+                    .filter(|l| !l.is_empty());
                 let mut kind = match typeflag {
                     b'0' | 0 | b'7' => {
                         if name.ends_with('/') {
@@ -252,18 +314,13 @@ pub fn tar(data: &[u8], max_members: usize) -> Option<Listing> {
                     b'6' => MemberKind::Fifo,
                     _ => MemberKind::Other,
                 };
-                if std::mem::take(&mut pax_sparse) {
+                if std::mem::take(&mut pax_sparse) || !global_sparse.is_empty() {
                     kind = MemberKind::Other;
                     out.warnings.push(format!("{name}: GNU sparse reconstruction is unsupported; stored extents are not the complete file"));
                 }
                 let mode = h.get(100..108).and_then(octal).and_then(|m| u32::try_from(m).ok()).unwrap_or(0);
                 if body.is_none() && kind == MemberKind::File {
                     out.warnings.push(format!("{name}: data runs past the end of the input"));
-                }
-                if out.members.len() >= max_members {
-                    out.truncated = true;
-                    out.length = pos as u64;
-                    break;
                 }
                 out.members.push(Member {
                     name,
@@ -302,11 +359,17 @@ fn pax_record(data: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
 }
 
 fn hex_field(f: &[u8]) -> Option<u64> {
+    if !f.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
     let s = std::str::from_utf8(f).ok()?;
     u64::from_str_radix(s, 16).ok()
 }
 
 fn oct_field(f: &[u8]) -> Option<u64> {
+    if !f.iter().all(|b| (b'0'..=b'7').contains(b)) {
+        return None;
+    }
     let s = std::str::from_utf8(f).ok()?;
     u64::from_str_radix(s, 8).ok()
 }
@@ -481,6 +544,63 @@ pub fn member_data<'a>(data: &'a [u8], m: &Member) -> Option<&'a [u8]> {
 mod tests {
     use super::*;
     use craft_anything_testkit::firmware as fx;
+
+    #[test]
+    fn plus_sign_in_cpio_fields_is_rejected() {
+        assert_eq!(hex_field(b"+000000A"), None);
+        assert_eq!(oct_field(b"+00012"), None);
+        assert_eq!(hex_field(b"0000000A"), Some(10));
+        assert_eq!(oct_field(b"00012"), Some(10));
+    }
+
+    fn global_record(key: &str, value: &str) -> String {
+        let tail = format!(" {key}={value}\n");
+        let mut len = tail.len() + 1;
+        loop {
+            let record = format!("{len}{tail}");
+            if record.len() == len {
+                return record;
+            }
+            len = record.len();
+        }
+    }
+
+    #[test]
+    fn global_name_copies_stop_before_spending_the_budget() {
+        let global = global_record("path", "shared");
+        let data = fx::tar_entries(&[("global", b'g', global.as_bytes(), ""), ("one", b'0', b"", ""), ("two", b'0', b"", ""), ("three", b'0', b"", "")]);
+        let listing = tar_with_name_copy_limit(&data, 10, 12).unwrap();
+        assert_eq!(listing.members.len(), 2);
+        assert!(listing.members.iter().all(|m| m.name == "shared"));
+        assert_eq!(listing.stop_reason, Some(StopReason::GlobalNameBudget));
+        assert!(!listing.complete && !listing.truncated);
+        assert!(listing.warnings.iter().any(|w| w.contains("name-byte budget")));
+        assert_eq!(listing.length, 2048);
+        assert!(tar_with_name_copy_limit(&data, 10, 18).unwrap().complete);
+    }
+
+    #[test]
+    fn local_names_and_unused_global_links_do_not_spend_copy_bytes() {
+        let global = global_record("path", "name") + &global_record("linkpath", "unused-link");
+        let local = global_record("path", "local-name");
+        let data =
+            fx::tar_entries(&[("global", b'g', global.as_bytes(), ""), ("local", b'x', local.as_bytes(), ""), ("one", b'0', b"", ""), ("two", b'0', b"", "")]);
+        let listing = tar_with_name_copy_limit(&data, 10, 4).unwrap();
+        assert!(listing.complete);
+        assert_eq!(listing.members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["local-name", "name"]);
+        assert!(listing.members.iter().all(|m| m.link_target.is_none()));
+    }
+
+    #[test]
+    fn global_names_and_links_share_the_decoded_byte_budget() {
+        let global = global_record("path", "é") + &global_record("linkpath", "中");
+        let data = fx::tar_entries(&[("global", b'g', global.as_bytes(), ""), ("one", b'2', b"", "fallback"), ("two", b'1', b"", "fallback")]);
+        let listing = tar_with_name_copy_limit(&data, 10, 5).unwrap();
+        assert_eq!(listing.members.len(), 1);
+        assert_eq!(listing.members[0].link_target.as_deref(), Some("中"));
+        assert_eq!(listing.stop_reason, Some(StopReason::GlobalNameBudget));
+        assert!(tar_with_name_copy_limit(&data, 10, 10).unwrap().complete);
+    }
 
     #[test]
     fn oversized_gnu_names_do_not_alias_their_truncated_prefix() {

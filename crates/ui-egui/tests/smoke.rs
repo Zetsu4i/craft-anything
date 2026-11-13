@@ -1788,7 +1788,7 @@ fn a_note_waiting_for_the_builder_can_be_taken_back_into_the_prompt_box() {
     h.state_mut().open_workspace(a.clone());
     h.state_mut().follow_up(Some("Add tags".into()));
     h.run_steps(2);
-    // Notes sent while it works wait under the conversation, not in it.
+    // Waiting notes only join the saved conversation once the builder reads them.
     for note in ["Make them blue", "And sortable"] {
         h.state_mut().state.project_input = note.into();
         h.state_mut().send_message();
@@ -2266,6 +2266,43 @@ fn a_running_build_says_what_it_is_on_and_opens_up_into_its_activity() {
     assert!(runs.finish(&ws.root));
     h.run_steps(3);
     h.get_by_label("What happened in this build");
+}
+
+#[test]
+fn a_long_waiting_note_leaves_the_live_activity_and_prompt_visible() {
+    use craft_anything_ai::{
+        AgentEvent,
+        rebuild::{RunEvent, StandIns},
+    };
+    use craft_anything_engine::workspace::{Step, TargetRef, Workspace};
+    let d = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(d.path(), "Alpha", "A notes app", TargetRef::None).unwrap();
+    let runs = StandIns::new();
+    let (dir, r) = (d.path().to_path_buf(), runs.clone());
+    let size = egui::vec2(1280.0, 600.0);
+    let mut h = harness_sized(size, move || stand_in_app(dir, &r));
+    h.state_mut().open_workspace(ws.clone());
+    h.state_mut().follow_up(Some("Add tags".into()));
+    assert!(runs.send(&ws.root, RunEvent::Step { step: Step::Build, text: "Building the first version…".into() }));
+    assert!(runs.send(
+        &ws.root,
+        RunEvent::Agent(AgentEvent::ToolStarted { call_id: "test".into(), tool: "Bash".into(), input: serde_json::json!({"command": "cargo test --quiet"}) })
+    ));
+    h.run_steps(4);
+
+    let note = "Please make the notes sortable and keep the selected tags.\n".repeat(160);
+    h.state_mut().state.project_input = note.trim_end().into();
+    h.state_mut().send_message();
+    h.run_steps(4);
+
+    let prompt = h.get_by_label("Ask for a change").rect();
+    assert!(prompt.bottom() <= size.y, "the prompt box is on the screen");
+    let activity = h.query_all_by_label_contains("Now: Running cargo test --quiet").next().expect("the live activity is shown").rect();
+    assert!(activity.top() >= 0.0 && activity.bottom() < prompt.top(), "the live activity is visible above the prompt");
+    let details = h.get_by_label("More detail").rect();
+    assert!(details.top() >= 0.0 && details.bottom() < prompt.top(), "the activity log can be opened");
+    let send = h.get_by_label("Send now").rect();
+    assert!(send.top() >= 0.0 && send.bottom() < activity.top(), "the waiting note's controls are reachable");
 }
 
 #[test]
@@ -2790,6 +2827,52 @@ fn only_the_claude_desktop_app_is_named_when_nothing_can_build() {
     h.state_mut().detected = Some(vec![remote("Claude Code on box"), local]);
     h.run_steps(2);
     assert!(h.query_by_label("The Claude desktop app is installed, but building needs Claude Code, its separate command-line tool. Install Claude Code, sign in to it once in a terminal, then look again.").is_none());
+}
+
+/// The discovery tabs and Detect action stay separate and evenly spaced in Settings → AI.
+#[test]
+fn ai_discovery_controls_have_even_spacing() {
+    for (width, mode, count) in [(760.0, Mode::Beginner, 0), (900.0, Mode::Experienced, 0), (1280.0, Mode::Beginner, 12), (1280.0, Mode::Experienced, 12)] {
+        let mut h = harness_sized(egui::vec2(width, 1000.0), move || {
+            let mut a = demo::app(demo::engine(mode, true));
+            a.backends.clear();
+            a.detected = Some(
+                [BackendKind::Openai, BackendKind::AgentCli]
+                    .into_iter()
+                    .flat_map(|kind| {
+                        (0..count).map(move |i| craft_anything_ai::Detected {
+                            suggestion: BackendConfig {
+                                name: format!("Fixture {kind:?} {i}"),
+                                kind,
+                                model: "fixture".into(),
+                                base_url: None,
+                                ssh_host: None,
+                                enabled: true,
+                            },
+                            reason: "Controlled discovery result".into(),
+                            needs_key: false,
+                        })
+                    })
+                    .collect(),
+            );
+            a.state.settings_open = true;
+            a.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+            a
+        });
+        h.run_steps(4);
+        let providers = h.get_by_label(&format!("Providers ({count})")).rect();
+        let harnesses = h.get_by_label(&format!("Harnesses ({count})")).rect();
+        let detect = h.get_by_label("Detect").rect();
+        assert!(!providers.intersects(detect) && !harnesses.intersects(detect), "controls overlap at {width}: {providers:?}, {harnesses:?}, {detect:?}");
+        let tab_gap = harnesses.left() - providers.right();
+        let action_gap = detect.left() - harnesses.right();
+        assert!(tab_gap > 0.0 && action_gap > 0.0, "controls need a visible gap at {width}");
+        assert!((tab_gap - action_gap).abs() <= 1.0, "spacing differs at {width}: {tab_gap} vs {action_gap}");
+        assert!(providers.top() < detect.bottom() && detect.top() < providers.bottom(), "controls share a row at {width}");
+        h.get_by_label(&format!("Harnesses ({count})")).click();
+        h.run_steps(2);
+        assert_eq!(h.state().state.detect_tab, Some(craft_anything_ui_egui::detect_tabs::DetectTab::Harnesses));
+    }
 }
 
 /// A long reason on a card for an AI found on this computer wraps beside its Add button; it used

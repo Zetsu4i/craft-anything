@@ -345,7 +345,7 @@ fn native_function_references_list(ctx: &mut Ctx<'_>, params: Value) -> Result<T
                 }
             }
             Direction::Outgoing => {
-                for (from, xs) in st.prog.xrefs_from.range(f.entry..f.end.max(f.entry + 1)) {
+                for (from, xs) in f.address_bounds().into_iter().flat_map(|range| st.prog.xrefs_from.range(range)) {
                     if !f.contains(*from) {
                         continue;
                     }

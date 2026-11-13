@@ -25,6 +25,8 @@ const SAMPLE: usize = 8;
 /// Longest module name, and most name text one PYZ keeps: its table can share one long string.
 const MAX_NAME: usize = 4096;
 const MAX_NAME_TEXT: usize = 64 << 20;
+/// Expanded PYZ paths and namespace names retained across a single listing.
+const MAX_PYZ_PATH_BYTES: usize = 8 << 20;
 /// In front of a PYZ module's magic number in its kind.
 const PYZ_KIND: &str = "pyz_module magic=";
 /// What each type code in the table means.
@@ -138,7 +140,7 @@ fn read_table(data: &[u8], c: &Cookie) -> (Vec<Member>, Option<String>) {
             let flag = r.u8(at + 16)?;
             let type_code = r.u8(at + 17)?;
             let name = r.slice(at + ENTRY_HEAD, len - ENTRY_HEAD)?;
-            let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
+            let end = name.iter().position(|b| *b == 0)?;
             let path = String::from_utf8_lossy(name.get(..end)?).into_owned();
             let in_payload = offset.checked_add(stored_size).is_some_and(|end| end <= c.toc_at as u64);
             let compression = match (in_payload, flag) {
@@ -234,7 +236,7 @@ fn module_path(pyz: &str, name: &str, is_package: bool) -> String {
     if is_package { format!("{pyz}.modules/{inner}/__init__.pyc") } else { format!("{pyz}.modules/{inner}.pyc") }
 }
 
-fn read_pyz(data: &[u8], member: &PackedEntry, room: usize, key_seen: bool) -> Result<PyzRead, String> {
+fn read_pyz(data: &[u8], member: &PackedEntry, room: usize, key_seen: bool, remaining_path_bytes: &mut usize) -> Result<PyzRead, String> {
     if member.compression == Compression::Unreadable {
         return Err("its stored bytes are not readable".into());
     }
@@ -262,13 +264,32 @@ fn read_pyz(data: &[u8], member: &PackedEntry, room: usize, key_seen: bool) -> R
     let encrypted = key_seen || key_inside || unzipped;
     let code_kind = format!("{PYZ_KIND}{magic:04x}");
     let outside = modules.iter().filter(|m| !in_range(m)).count();
-    let truncated = modules.len() < total;
+    let mut truncated = modules.len() < total;
     let mut entries = Vec::new();
     let mut namespaces = Vec::new();
     for m in &modules {
+        let namespace = m.kind == 3 && m.len == 0;
+        // A short table can repeat a long CArchive member prefix for every module. Charge the
+        // complete identity before allocating it; replacing dots with slashes keeps its byte size.
+        let path_bytes = if namespace {
+            Some(m.name.len())
+        } else {
+            let extra = match m.kind {
+                0 => ".modules/".len() + ".pyc".len(),
+                1 | 3 => ".modules/".len() + "/__init__.pyc".len(),
+                2 => ".data/".len(),
+                _ => ".members/".len(),
+            };
+            member.path.len().checked_add(m.name.len()).and_then(|n| n.checked_add(extra))
+        };
+        let Some(path_bytes) = path_bytes.filter(|n| *n <= *remaining_path_bytes) else {
+            truncated = true;
+            break;
+        };
+        *remaining_path_bytes -= path_bytes;
         // Modern namespace packages have a table row but no code object to unpack. Older
         // writers could store code for them; keep that as a package when it actually exists.
-        if m.kind == 3 && m.len == 0 {
+        if namespace {
             namespaces.push(m.name.clone());
             continue;
         }
@@ -326,8 +347,9 @@ impl PackedFormat for PyInstaller {
         let mut any_encrypted = key_seen;
         let mut nested = Vec::new();
         let mut room = MAX_ENTRIES.saturating_sub(members.len());
+        let mut remaining_path_bytes = MAX_PYZ_PATH_BYTES;
         for m in members.iter().filter(|m| m.type_code == b'z') {
-            match read_pyz(data, &m.entry, room, key_seen) {
+            match read_pyz(data, &m.entry, room, key_seen, &mut remaining_path_bytes) {
                 Ok(read) => {
                     room = room.saturating_sub(read.entries.len() + read.namespaces.len());
                     any_encrypted |= read.encrypted;
@@ -389,10 +411,11 @@ impl PackedFormat for PyInstaller {
 /// A member's bytes: a PYZ module gets the `.pyc` header its magic number asks for, any other
 /// member is handed back as stored.
 fn read_member(data: &[u8], entry: &PackedEntry, max_bytes: u64) -> Result<Vec<u8>, FormatError> {
-    const PYC_HEADER_BYTES: u64 = 16;
     let magic = entry.kind.as_deref().and_then(|k| k.strip_prefix(PYZ_KIND)).and_then(|m| u16::from_str_radix(m, 16).ok());
     let body_limit = match magic {
-        Some(_) => max_bytes.checked_sub(PYC_HEADER_BYTES).ok_or_else(|| FormatError::TooLarge(format!("{} needs a .pyc header", entry.path)))?,
+        Some(magic) => {
+            max_bytes.checked_sub(pyc::header_size(magic) as u64).ok_or_else(|| FormatError::TooLarge(format!("{} needs a .pyc header", entry.path)))?
+        }
         None => max_bytes,
     };
     let body = read_stored(data, entry, body_limit)?;
@@ -435,7 +458,8 @@ impl PackedFormat for PyzArchive {
             compression: Compression::None,
             kind: None,
         };
-        let read = read_pyz(data, &whole, MAX_ENTRIES, false).map_err(FormatError::Malformed)?;
+        let mut remaining_path_bytes = MAX_PYZ_PATH_BYTES;
+        let read = read_pyz(data, &whole, MAX_ENTRIES, false, &mut remaining_path_bytes).map_err(FormatError::Malformed)?;
         let mut notes = Vec::new();
         if read.encrypted {
             notes.push(

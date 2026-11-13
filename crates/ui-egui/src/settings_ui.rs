@@ -906,22 +906,18 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
     }
     ui.add_space(8.0);
     let detected = app.detected.clone().unwrap_or_default();
-    let mut tab = {
-        let (providers, harnesses) = crate::detect_tabs::counts(&detected);
-        crate::detect_tabs::resolve(app.state.detect_tab, providers, harnesses)
-    };
-    ui.horizontal(|ui| {
-        widgets::caption(ui, "Found on this computer");
-        ui.add_space(12.0);
-        tab = crate::detect_tabs::bar(ui, &mut app.state.detect_tab, &detected);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    widgets::caption(ui, "Found on this computer");
+    let tab = ui
+        .horizontal_wrapped(|ui| {
+            let tab = crate::detect_tabs::buttons(ui, &mut app.state.detect_tab, &detected);
             if app.detecting {
                 ui.add(crate::widgets::Spinner::new().color(t.accent));
             } else if widgets::secondary(ui, Some("radar"), "Detect").clicked() {
                 app.detect_backends();
             }
-        });
-    });
+            tab
+        })
+        .inner;
     ui.add_space(4.0);
     if detected.is_empty() && !app.detecting {
         ui.label(

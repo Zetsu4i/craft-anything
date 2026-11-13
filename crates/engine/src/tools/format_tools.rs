@@ -304,7 +304,7 @@ fn formats_wasm_module_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutp
         r.producers.iter().find(|f| f.field == "language").and_then(|f| f.values.first()).map(|v| format!(", written in {}", v.name)).unwrap_or_default()
     );
     if r.truncated {
-        lims.push(Limitation::new("truncated", format!("Lists stop at {} entries.", wasm::MAX_ITEMS)));
+        lims.push(Limitation::new("truncated", "Lists or derived metadata are incomplete; see warnings for the limits reached."));
     }
     if r.parse_error.is_some() {
         lims.push(Limitation::new("parse_stopped", "Reading stopped at a damaged section; later sections are missing from the lists."));
@@ -324,7 +324,7 @@ fn formats_wasm_module_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutp
                        "data_segments": r.data_segments, "element_segments": r.element_segments, "custom_sections": r.custom_sections.len()},
             "exports": r.exports.iter().take(50).collect::<Vec<_>>(),
             "module_name": r.module_name, "producers": r.producers, "target_features": r.target_features,
-            "source_mapping_url": r.source_mapping_url, "wat": wat, "glue": glue, "warnings": r.warnings,
+            "source_mapping_url": r.source_mapping_url, "truncated": r.truncated, "wat": wat, "glue": glue, "warnings": r.warnings,
         }),
         WasmDetail::Complete => json!({
             "encoding": r.encoding, "version": r.version, "size": r.size, "validation": r.validation, "parse_error": r.parse_error,
@@ -496,12 +496,57 @@ mod tests {
         assert_eq!(r["glue"][0]["scan"]["matched_imports"][0], "env.log");
         let s = call(&e, "formats_wasm_module_show", json!({"path": p, "detail": "summary"}));
         assert_eq!(s["result"]["counts"]["exports"], 3);
+        assert_eq!(s["result"]["truncated"], false);
+        assert_eq!(r["truncated"], false);
         let mut bad = fx::wasm_module();
         bad.truncate(bad.len() - 7);
         let b = call(&e, "formats_wasm_module_show", json!({"path": temp_file("bad.wasm", &bad), "include_wat": true}));
         assert_eq!(b["result"]["validation"]["valid"], false);
         assert!(b["summary"].as_str().unwrap().contains("INVALID"));
         call_err(&e, "formats_wasm_module_show", json!({"path": temp_file("x.wasm", b"nope")}));
+    }
+
+    /// Both views disclose metadata omitted by a byte budget before the entry-count limit.
+    #[test]
+    fn wasm_string_budget_is_disclosed_in_summary_and_complete_views() {
+        fn leb(mut value: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            while value >= 128 {
+                out.push((value as u8 & 0x7f) | 0x80);
+                value >>= 7;
+            }
+            out.push(value as u8);
+            out
+        }
+        fn section(module: &mut Vec<u8>, id: u8, body: &[u8]) {
+            module.push(id);
+            module.extend(leb(body.len()));
+            module.extend(body);
+        }
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+        let mut signature = vec![1, 0x60];
+        signature.extend(leb(1000));
+        signature.extend(std::iter::repeat_n(0x7f, 1000));
+        signature.push(0);
+        section(&mut module, 1, &signature);
+        let mut functions = leb(16_384);
+        functions.extend(std::iter::repeat_n(0, 16_384));
+        section(&mut module, 3, &functions);
+        let mut bodies = leb(16_384);
+        for _ in 0..16_384 {
+            bodies.extend([2, 0, 0x0b]);
+        }
+        section(&mut module, 10, &bodies);
+        let e = engine_with("shared-types.wasm", &module);
+        for detail in ["summary", "complete"] {
+            let v = call(&e, "formats_wasm_module_show", json!({"detail": detail, "limit": 1}));
+            assert_eq!(v["result"]["validation"]["valid"], true);
+            assert_eq!(v["result"]["truncated"], true);
+            assert!(v["result"]["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("byte budget")));
+            let limitation = v["limitations"].as_array().unwrap().iter().find(|l| l["code"] == "truncated").unwrap();
+            assert!(limitation["message"].as_str().unwrap().contains("derived metadata"));
+            assert!(!limitation["message"].as_str().unwrap().contains("100000"));
+        }
     }
 
     #[test]

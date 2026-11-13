@@ -281,6 +281,7 @@ fn decode_attribute(names: &Names<'_, '_>, ctor_sig: &[u8], blob: &[u8]) -> (Vec
             };
             fixed.push(ca_value(&mut c, et, 0)?);
         }
+        names.finish_signature(&s, ());
         let nnamed = c.u16()?;
         for _ in 0..nnamed.min(64) {
             let _kind = c.u8()?;
@@ -420,6 +421,7 @@ pub fn inventory(a: &Assembly<'_>) -> Inventory {
     if cli.flags & pe::COMIMAGE_FLAGS_ILONLY == 0 {
         warnings.push("the image is not IL-only: native code may run that metadata does not describe".into());
     }
+    names.add_signature_warning(&mut warnings);
     Inventory {
         pe_kind: if a.pe.optional_magic == 0x20b { "PE32+" } else { "PE32" },
         machine: a.pe.machine_name(),
@@ -996,7 +998,9 @@ pub fn members(a: &Assembly<'_>, opts: &MemberOptions) -> Members {
             events: events.remove(&row).unwrap_or_default(),
         });
     }
-    Members { types, total_types: md.rows(t::TYPE_DEF), total_methods, total_fields, truncated, warnings: md.warnings.clone() }
+    let mut warnings = md.warnings.clone();
+    names.add_signature_warning(&mut warnings);
+    Members { types, total_types: md.rows(t::TYPE_DEF), total_methods, total_fields, truncated, warnings }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1141,6 +1145,7 @@ pub fn native_boundaries(a: &Assembly<'_>) -> NativeBoundaries {
         }
     }
     let cli = &a.pe.cli;
+    res.names.add_signature_warning(&mut warnings);
     NativeBoundaries {
         pinvokes,
         internal_calls,

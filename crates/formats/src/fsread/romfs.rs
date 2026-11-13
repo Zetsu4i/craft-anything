@@ -15,11 +15,12 @@ fn align16(n: usize) -> Option<usize> {
 /// Name field length (NUL-terminated, rounded up to 16), and the trimmed name.
 fn name_at(data: &[u8], off: usize, max_name: usize) -> Option<(String, usize)> {
     let rest = data.get(off..)?;
-    let end = rest.iter().take(max_name.clamp(1, 1024)).position(|&b| b == 0)?;
+    let end = rest.iter().take(max_name.min(1024) + 1).position(|&b| b == 0)?;
     let name = String::from_utf8_lossy(rest.get(..end)?).into_owned();
     Some((name, align16(end + 1)?))
 }
 
+/// Read a ROMFS image within the caller's recovery limits.
 pub fn read(data: &[u8], limits: &Limits) -> FsImage {
     let mut img = FsImage::new("romfs");
     let r = Reader::new(data);
@@ -52,7 +53,7 @@ pub fn read(data: &[u8], limits: &Limits) -> FsImage {
     let mut visited = BTreeSet::new();
     // A dot-named root is the container itself, not a child to skip with `.` and `..`.
     let root_container = r.u32_be(root).is_some_and(|kind| kind & 7 == 1)
-        && root.checked_add(16).and_then(|at| name_at(data, at, limits.max_name)).is_some_and(|(name, _)| name == "." || name.is_empty());
+        && root.checked_add(16).and_then(|at| name_at(data, at, limits.max_name.max(1))).is_some_and(|(name, _)| name == "." || name.is_empty());
     if root_container {
         visited.insert(root);
         let first = root.checked_add(4).and_then(|at| r.u32_be(at)).unwrap_or(0) as usize;
@@ -142,6 +143,27 @@ fn walk(data: &[u8], first: usize, parent: &str, limits: &Limits, img: &mut FsIm
 mod tests {
     use super::*;
 
+    /// A zero name budget rejects stored names while still recognizing root containers.
+    #[test]
+    fn zero_name_limit_preserves_root_recognition() {
+        let limits = Limits { max_name: 0, ..Limits::default() };
+        let mut file = craft_anything_testkit::firmware::romfs_image();
+        file[32..36].copy_from_slice(&2u32.to_be_bytes());
+        file[36..44].fill(0);
+        file[48..50].copy_from_slice(b"a\0");
+        let image = read(&file, &limits);
+        assert!(image.entries.is_empty());
+        assert!(!image.complete);
+        for name in [b".\0".as_slice(), b"\0".as_slice()] {
+            let mut directory = file.clone();
+            directory[32..36].copy_from_slice(&1u32.to_be_bytes());
+            directory[48..48 + name.len()].copy_from_slice(name);
+            let image = read(&directory, &limits);
+            assert!(image.entries.is_empty());
+            assert!(image.complete, "{:?}", image.warnings);
+        }
+    }
+
     fn wide_image(count: usize, cycle: Option<u32>) -> Vec<u8> {
         fn put(data: &mut [u8], at: usize, value: u32) {
             data[at..at + 4].copy_from_slice(&value.to_be_bytes());
@@ -199,6 +221,21 @@ mod tests {
             assert_eq!(cyclic.entries, image.entries);
             assert!(cyclic.warnings.iter().any(|warning| warning.contains("header cycle")));
         }
+    }
+
+    /// Names at the configured byte limit fit while longer names stop recovery.
+    #[test]
+    fn name_limit_counts_name_bytes_without_terminator() {
+        let mut data = craft_anything_testkit::firmware::romfs_image();
+        let limits = Limits { max_name: 12, ..Limits::default() };
+        data[80..92].copy_from_slice(b"readme12.txt");
+        data[92] = 0;
+        let image = read(&data, &limits);
+        assert!(image.complete, "{:?}", image.warnings);
+        assert!(image.entries.iter().any(|entry| entry.path == "readme12.txt"));
+        data[92] = b'x';
+        data[93] = 0;
+        assert!(!read(&data, &limits).complete);
     }
 
     #[test]

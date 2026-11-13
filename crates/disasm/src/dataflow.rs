@@ -76,14 +76,32 @@ pub fn def_use(img: &Image, prog: &Program, f: &Function, max_nodes: usize, max_
         _ => "rax",
     };
     let mut out = DefUse::default();
-    // Decode.
+    // Parameters and instructions share one node budget. Charge before decoding so a
+    // small requested graph does not first allocate every instruction in the function.
+    let mut param_node: BTreeMap<String, usize> = BTreeMap::new();
+    for r in args.iter().take(max_nodes) {
+        let id = out.nodes.len();
+        param_node.insert((*r).to_string(), id);
+        out.nodes.push(DfNode { id, kind: "parameter", addr: None, text: format!("incoming {r}"), defines: vec![(*r).to_string()] });
+    }
+    out.truncated = param_node.len() < args.len();
+    let mut remaining = max_nodes.saturating_sub(out.nodes.len());
     let mut blocks: Vec<Vec<Insn>> = Vec::new();
+    let mut complete_blocks = Vec::new();
     for b in &f.blocks {
+        if remaining == 0 {
+            out.truncated = true;
+            break;
+        }
         let mut v = Vec::new();
         let mut consts = ArmConsts::default();
         let mut a = b.start;
-        while a < b.end && v.len() < 20_000 {
+        while a < b.end && v.len() < 20_000 && remaining > 0 {
             let Some(mut i) = img.decode(a, true) else { break };
+            let next = i.end();
+            if next <= a {
+                break;
+            }
             if mode == Mode::A64 {
                 consts.apply(&mut i);
             }
@@ -103,28 +121,19 @@ pub fn def_use(img: &Image, prog: &Program, f: &Function, max_nodes: usize, max_
             if matches!(i.flow, Flow::Return) && !i.reads.iter().any(|x| x == ret) {
                 i.reads.push(ret.to_string());
             }
-            a = i.end();
+            a = next;
+            remaining -= 1;
             v.push(i);
         }
+        let complete = a >= b.end;
+        out.truncated |= !complete;
+        complete_blocks.push(complete);
         blocks.push(v);
     }
-    let total: usize = blocks.iter().map(Vec::len).sum();
-    if total > max_nodes {
-        out.truncated = true;
-    }
-    // Nodes: parameters, then instructions (capped).
+    // Nodes: parameters, then the instructions already charged above.
     let mut node_of: BTreeMap<u64, usize> = BTreeMap::new();
-    let mut param_node: BTreeMap<String, usize> = BTreeMap::new();
-    for r in args {
-        let id = out.nodes.len();
-        param_node.insert((*r).to_string(), id);
-        out.nodes.push(DfNode { id, kind: "parameter", addr: None, text: format!("incoming {r}"), defines: vec![(*r).to_string()] });
-    }
     for v in &blocks {
         for i in v {
-            if out.nodes.len() >= max_nodes {
-                break;
-            }
             let id = out.nodes.len();
             node_of.insert(i.addr, id);
             out.nodes.push(DfNode {
@@ -138,10 +147,15 @@ pub fn def_use(img: &Image, prog: &Program, f: &Function, max_nodes: usize, max_
     }
     // Reaching definitions: reg → set of defining node ids.
     type Defs = BTreeMap<String, BTreeSet<usize>>;
-    let index: BTreeMap<u64, usize> = f.blocks.iter().enumerate().map(|(i, b)| (b.start, i)).collect();
-    let n = f.blocks.len();
+    let n = blocks.len();
+    let index: BTreeMap<u64, usize> = f.blocks.iter().take(n).enumerate().map(|(i, b)| (b.start, i)).collect();
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (i, b) in f.blocks.iter().enumerate() {
+    for (i, b) in f.blocks.iter().take(n).enumerate() {
+        if complete_blocks.get(i) != Some(&true) {
+            // An omitted tail may overwrite registers before reaching a successor.
+            // Do not present definitions from the retained prefix as its output.
+            continue;
+        }
         for s in &b.succs {
             if let Some(&j) = index.get(s)
                 && let Some(p) = preds.get_mut(j)
@@ -150,12 +164,13 @@ pub fn def_use(img: &Image, prog: &Program, f: &Function, max_nodes: usize, max_
             }
         }
     }
-    let entry = index.get(&f.entry).copied().unwrap_or(0);
+    let entry = index.get(&f.entry).copied();
     let mut entry_defs: Defs = BTreeMap::new();
     for (r, id) in &param_node {
         entry_defs.insert(r.clone(), BTreeSet::from([*id]));
     }
-    let noreturn_calls: BTreeSet<u64> = f.calls.iter().filter(|call| prog.call_is_noreturn(call)).map(|call| call.site).collect();
+    let noreturn_calls: BTreeSet<u64> =
+        f.calls.iter().filter(|call| node_of.contains_key(&call.site) && prog.call_is_noreturn(call)).map(|call| call.site).collect();
     let record_writes = |cur: &mut Defs, i: &Insn, id: usize| {
         let conditional_call = i.cond.is_some() && matches!(i.flow, Flow::Call { .. } | Flow::IndirectCall { .. });
         if conditional_call && noreturn_calls.contains(&i.addr) {
@@ -190,7 +205,7 @@ pub fn def_use(img: &Image, prog: &Program, f: &Function, max_nodes: usize, max_
         changed = false;
         rounds += 1;
         for b in 0..n {
-            let mut inp: Defs = if b == entry { entry_defs.clone() } else { BTreeMap::new() };
+            let mut inp: Defs = if Some(b) == entry { entry_defs.clone() } else { BTreeMap::new() };
             for &p in preds.get(b).map(Vec::as_slice).unwrap_or(&[]) {
                 if let Some(po) = outs.get(p) {
                     for (r, ds) in po {

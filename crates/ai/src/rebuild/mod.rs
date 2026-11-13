@@ -31,7 +31,7 @@ pub use craft_anything_platform::serve::StaticServer;
 use craft_anything_platform::serve::serve_dir;
 use craft_anything_platform::sync::Mutex;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -267,6 +267,10 @@ pub struct RebuildRun {
 impl RebuildRun {
     /// Start a run on a worker thread. Fails fast (before any work) when no coding agent is set up.
     pub fn start(hub: &AiHub, ws: Workspace, opts: RunOptions) -> Result<RebuildRun, ToolError> {
+        // The project as it is now. A run that waited in the queue, or one started as the project's
+        // last run was ending, holds a copy from before that run's last saves (its session), and
+        // everything below, the worker's saves included, works from this copy.
+        let mut ws = Workspace::open(&ws.root).unwrap_or(ws);
         let cfg = hub.config();
         let entry = builder_backend(&cfg, opts.backend.as_deref().or_else(|| project_builder(&cfg, &ws)))?;
         // The person's choice of mode is a session setting. A run that waited its turn uses the mode
@@ -313,9 +317,13 @@ impl RebuildRun {
         let preview: Arc<Mutex<Option<StaticServer>>> = Arc::default();
         let notes: Arc<Mutex<Vec<Note>>> = Arc::default();
         let inbox = Inbox::new(ws.inbox_dir());
-        // Notes left by an earlier run would be handed over again (ids restart with the process);
-        // cleared before the app can add any to this one.
-        notes::clear(&notes::notes_dir(&ws.inbox_dir()));
+        // Notes an earlier run never handed over (the app closed while they waited, #1620) wait for
+        // this run's builder; their old files go before the app can add any to this one.
+        let left = notes::take_left(&notes::notes_dir(&ws.inbox_dir()), opts.message.is_none());
+        craft_anything_engine::inbox::clear_activity(&ws.inbox_dir());
+        if !left.is_empty() {
+            left_notes_are_a_request(&mut ws);
+        }
         let root = ws.root.clone();
         // The project's conversation: the run keeps it in the folder as it goes.
         let feed = Arc::new(Mutex::new(feed::FeedLog::open(&ws)));
@@ -364,7 +372,13 @@ impl RebuildRun {
             })
             .map_err(|e| ToolError::internal(e.to_string()))?;
         let activity = feed.lock().unwrap_or_else(PoisonError::into_inner).activity();
-        Ok(RebuildRun { rx, stop, inbox, running, preview, notes, clean_room, feed, root, started: Instant::now(), activity })
+        let run = RebuildRun { rx, stop, inbox, running, preview, notes, clean_room, feed, root, started: Instant::now(), activity };
+        // Waiting again with files of their own: the builder takes them at its next step or after
+        // its turn, and a run that ends first hands them to the next one, as with any note.
+        for n in left {
+            run.add_note(n.text, n.shown, n.pictures);
+        }
+        Ok(run)
     }
 
     /// Add something while it works; the agent reads it at its next step, and only then does it
@@ -393,7 +407,8 @@ impl RebuildRun {
         // Also left for an agent that takes notes at its next step; without it, after the turn.
         // The in-memory note keeps the raw text: if a later run takes it, that run filters the
         // answers by its own mode instead of inheriting this run's.
-        if let Err(e) = notes::hand_over(&notes::notes_dir(self.inbox.dir()), id, &file_text) {
+        let left = notes::Left { text: text.clone(), shown: shown.clone(), pictures: pictures.clone() };
+        if let Err(e) = notes::hand_over(&notes::notes_dir(self.inbox.dir()), id, &file_text, Some(&left)) {
             log::warn!("A note waits for the builder's turn to end: {}", e.message);
         }
         self.notes.lock().unwrap_or_else(PoisonError::into_inner).push(Note { id, text, shown, pictures, questions });
@@ -1331,19 +1346,20 @@ impl Worker {
         }
         let mut reply = String::new();
         let mut failed = None;
+        let mut said = HashMap::new();
+        // An API builder's next tool (a decompile waiting on Ghidra, #1714) may already hold the
+        // session when its last one finishes: the refresh waits for a free moment, so the loop
+        // keeps reading what that tool says meanwhile.
+        let mut refresh = false;
         loop {
             if self.stop.is_cancelled() {
                 agent.stop();
             }
             for e in agent.poll() {
-                if matches!(e, AgentEvent::ToolFinished { .. } | AgentEvent::TurnDone { .. }) {
-                    let mut session = self.engine.session();
-                    let project = session.project.clone().filter(|project| project.root == ws.investigation_dir());
-                    if let Some(project) = project
-                        && let Err(error) = session.open_project(project)
-                    {
-                        log::warn!("Couldn't refresh the investigation: {}", error.message);
-                    }
+                refresh |= matches!(e, AgentEvent::ToolFinished { .. });
+                if matches!(e, AgentEvent::TurnDone { .. }) {
+                    refresh_investigation(&mut self.engine.session(), ws);
+                    refresh = false;
                 }
                 match &e {
                     AgentEvent::TextDelta { text } => reply.push_str(text),
@@ -1382,8 +1398,15 @@ impl Worker {
                     return Ok(reply);
                 }
             }
+            if refresh && let Some(mut session) = self.engine.try_session() {
+                refresh_investigation(&mut session, ws);
+                refresh = false;
+            }
             self.relay_inbox();
             self.relay_read_notes(ws);
+            for line in newly_said(&ws.inbox_dir(), &mut said) {
+                self.emit(RunEvent::Step { step: Step::Build, text: line });
+            }
             self.answer_self_checks(ws)?;
             if self.usage.as_ref().is_some_and(|c| c.since.elapsed() >= USAGE_FLUSH) {
                 self.record_usage(None);
@@ -1423,6 +1446,54 @@ impl Worker {
             }
         }
     }
+}
+
+/// Notes an earlier run left are a request the person made, as a message is: they start the counts
+/// of unchanged turns and of checks that found no working build again, or a run carrying on from a
+/// build that reached either limit would stop before its builder reads them. Their files are gone
+/// by now, so a count that can't be saved is logged and the run starts anyway. The count is saved
+/// on the project as it is on disk: a run that waited in the queue holds a copy from before the
+/// run ahead of it finished, and saving that would undo what that run recorded (its session).
+fn left_notes_are_a_request(ws: &mut Workspace) {
+    let progress = BuildProgress::load(&ws.root).and_then(|mut p| {
+        p.reset();
+        p.save(&ws.root)
+    });
+    ws.manifest.not_working_checks = 0;
+    let checks = Workspace::open(&ws.root).and_then(|mut now| {
+        if now.manifest.not_working_checks == 0 {
+            return Ok(());
+        }
+        now.manifest.not_working_checks = 0;
+        now.save()
+    });
+    if let Err(e) = progress.and(checks) {
+        log::warn!("Couldn't start the build's counts again for the notes left waiting: {}", e.message);
+    }
+}
+
+/// Read the investigation again after the builder's tools changed it; a view refresh, so a failure
+/// is only logged.
+fn refresh_investigation(session: &mut craft_anything_engine::Session, ws: &Workspace) {
+    let project = session.project.clone().filter(|project| project.root == ws.investigation_dir());
+    if let Some(project) = project
+        && let Err(error) = session.open_project(project)
+    {
+        log::warn!("Couldn't refresh the investigation: {}", error.message);
+    }
+}
+
+/// What the tools working for the builder say that the feed hasn't shown yet (a decompile waiting
+/// on Ghidra, #1714): each wait's line once per change, as the one-time analysis is shown.
+fn newly_said(inbox: &Path, said: &mut HashMap<String, String>) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (wait, line) in craft_anything_engine::inbox::activity(inbox) {
+        if said.get(&wait) != Some(&line) {
+            said.insert(wait, line.clone());
+            lines.push(line);
+        }
+    }
+    lines
 }
 
 /// What the run says, and the status it leaves on the project, when it ends: paused, failed, or

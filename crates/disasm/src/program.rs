@@ -147,6 +147,12 @@ impl Function {
         self.blocks.iter().any(|b| addr >= b.start && addr < b.end)
     }
 
+    /// Bounds enclosing all nonempty body blocks, including code below the entry.
+    /// Addresses in gaps still need to be checked with `contains`.
+    pub fn address_bounds(&self) -> Option<std::ops::Range<u64>> {
+        self.blocks.iter().filter(|b| b.start < b.end).map(|b| b.start..b.end).reduce(|a, b| a.start.min(b.start)..a.end.max(b.end))
+    }
+
     pub fn block_at(&self, addr: u64) -> Option<&Block> {
         self.blocks.iter().find(|b| addr >= b.start && addr < b.end)
     }

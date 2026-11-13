@@ -381,7 +381,7 @@ fn cert_json(der_bytes: &[u8]) -> Value {
         Some(c) => json!({
             "subject": c.subject, "issuer": c.issuer, "serial": c.serial, "not_before": c.not_before, "not_after": c.not_after,
             "signature_algorithm": c.signature_algorithm, "public_key_algorithm": c.public_key_algorithm, "version": c.version,
-            "sha256": sha256_hex(der_bytes), "bytes": der_bytes.len(),
+            "sha256": sha256_hex(der_bytes), "bytes": der_bytes.len(), "notes": c.notes,
         }),
         None => json!({"sha256": sha256_hex(der_bytes), "bytes": der_bytes.len(), "error": "not a readable X.509 certificate"}),
     }
@@ -976,7 +976,10 @@ fn android_method_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, T
                 .map(|i| InsnRow { offset: format!("{:04x}", i.offset), text: d.format_insn(i), opcode: format!("{:#04x}", i.opcode), units: i.units })
                 .collect();
             if !complete {
-                lims.push(Limitation::new("listing_incomplete", "Decoding stopped at an instruction that runs past the end of the code."));
+                lims.push(Limitation::new(
+                    "listing_incomplete",
+                    "The bytecode is truncated or exceeds an instruction or payload limit; some instructions or payload details may be omitted.",
+                ));
             }
             (rows, code.tries.clone(), Some((code.registers, code.ins, code.outs)), complete)
         }
@@ -1266,6 +1269,20 @@ mod tests {
     use crate::Engine;
     use craft_anything_testkit::android as fx;
     use serde_json::json;
+
+    #[test]
+    fn certificate_json_keeps_non_minimal_length_notes_and_identity() {
+        let canonical = fx::certificate_der("Length Signer", "Fixture Org");
+        let value = craft_anything_formats::der::read(&canonical, 0).unwrap();
+        let mut changed = vec![value.tag, 0x83, 0, (value.len >> 8) as u8, value.len as u8];
+        changed.extend_from_slice(value.bytes(&canonical).unwrap());
+        let certificate = super::cert_json(&changed);
+        assert_eq!(certificate["subject"], "CN=Length Signer, O=Fixture Org");
+        assert_eq!(certificate["bytes"], changed.len());
+        assert!(certificate["error"].is_null());
+        assert!(certificate["notes"].as_array().unwrap().iter().any(|note| note.as_str().unwrap().contains("not strict DER")));
+        assert!(super::cert_json(&canonical)["notes"].as_array().unwrap().is_empty());
+    }
 
     fn apk() -> String {
         craft_anything_testkit::temp_file("notes.apk", &fx::notes_apk()).to_string_lossy().into_owned()

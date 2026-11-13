@@ -272,6 +272,8 @@ pub enum Done {
         backend: String,
         /// Why the pictures couldn't be copied, if they couldn't.
         pictures: Option<String>,
+        /// The folder already held a project: the request is its follow-up, not a new project's.
+        attached: bool,
     },
     /// A message's pictures were copied into its project (see `CraftApp::deliver`).
     Attached {
@@ -445,6 +447,8 @@ struct FirstFrames {
 }
 
 pub struct CraftApp {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) updates: updates::Updates,
     pub engine: Arc<Engine>,
     pub hub: Arc<AiHub>,
     pub state: UiState,
@@ -588,6 +592,12 @@ pub struct CraftApp {
 }
 
 impl CraftApp {
+    /// Show the last update's result once the native window begins drawing.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn show_update_outcome_on_start(&mut self) {
+        self.updates.startup();
+    }
+
     /// Initialize UI state from the shared engine's saved settings, waiting rather than substituting defaults.
     pub fn new(engine: Arc<Engine>, hub: Arc<AiHub>) -> Self {
         // Wait for the engine if it's busy: defaults here would show Clean room and no AI, and the
@@ -595,6 +605,8 @@ impl CraftApp {
         let settings = engine.session().settings.clone();
         i18n::set_language(&settings.language);
         CraftApp {
+            #[cfg(not(target_arch = "wasm32"))]
+            updates: Default::default(),
             engine,
             hub,
             state: UiState::default(),
@@ -1541,7 +1553,7 @@ impl CraftApp {
             }
             Done::Facts(f) => self.facts_read(job, Some(f)),
             Done::PicturesAdded(added) => self.pictures_added(added),
-            Done::Created { ws, request, backend, pictures } => self.created(*ws, request, backend, pictures),
+            Done::Created { ws, request, backend, pictures, attached } => self.created(*ws, request, backend, pictures, attached),
             Done::Thumb { path, image } => self.thumb_ready(path, image),
             Done::Preview { path, image } => self.preview_ready(path, image),
             Done::Tool { tool, params, route, result } => self.tool_done(tool, params, route, result),
@@ -1916,6 +1928,18 @@ impl CraftApp {
     /// Draw the whole interface.
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let safe = !self.jobs.busy()
+                && !self.runs.any_busy()
+                && !self.conversation.as_ref().is_some_and(|c| c.is_busy())
+                && !self.settings_dirty
+                && self.save_due.is_none()
+                && self.saving.is_none();
+            if self.updates.show(&ctx, safe) {
+                return;
+            }
+        }
         self.tick(&ctx);
         self.shortcuts(&ctx);
         #[cfg(target_os = "macos")]
@@ -2234,5 +2258,15 @@ pub fn kind_icon(k: TargetKind) -> &'static str {
         TargetKind::Evm => "zap",
         TargetKind::Sqlite => "database",
         TargetKind::Unknown => "file",
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod updates;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for CraftApp {
+    fn drop(&mut self) {
+        self.updates.finish();
     }
 }

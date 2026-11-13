@@ -295,8 +295,8 @@ fn bundle_info_plist(dir: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// A bundle's main executable.
-fn bundle_executable(dir: &Path) -> Option<PathBuf> {
+/// A bundle's main executable: the one its Info.plist names, else the one named like the bundle.
+pub fn bundle_executable(dir: &Path) -> Option<PathBuf> {
     let exe_name =
         bundle_info_plist(dir).and_then(|p| read_plist_file(&p)).and_then(|v| v.get("CFBundleExecutable").and_then(plist::Value::as_str).map(str::to_string));
     let stem = dir.file_stem().map(|s| s.to_string_lossy().into_owned());
@@ -919,13 +919,12 @@ fn apple_archive_decode(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
         ))
     })?;
     let tree = a.project(root);
-    let rows = a.rows();
-    let total = rows.len();
-    let page_rows: Vec<&keyed_archive::ObjectRow> = rows.iter().skip(p.offset).take(p.limit).collect();
-    let mut classes: BTreeMap<String, usize> = BTreeMap::new();
-    for r in &rows {
-        if let Some(c) = &r.class {
-            *classes.entry(c.clone()).or_insert(0) += 1;
+    let total = a.objects.len();
+    let page_rows = a.rows_page(p.offset, p.limit);
+    let mut classes: BTreeMap<&str, usize> = BTreeMap::new();
+    for i in 0..total {
+        if let Some(c) = a.class_name(i as u64) {
+            *classes.entry(c).or_insert(0) += 1;
         }
     }
     let summary = format!(
@@ -933,7 +932,7 @@ fn apple_archive_decode(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
         inp.name,
         if a.archiver.is_empty() { "an unnamed archiver" } else { a.archiver.as_str() },
         total,
-        a.class_of(root).unwrap_or_else(|| "a plain value".into())
+        a.class_name(root).unwrap_or("a plain value")
     );
     let mut b = builder(ctx, "apple_archive_decode", inp.subject.clone(), json!({"path": inp.path, "root": root_name, "offset": p.offset, "limit": p.limit}))
         .result(json!({
@@ -982,6 +981,10 @@ fn apple_assets_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
     let c = car::parse(&inp.bytes).map_err(|e| format_err(e, "an asset catalog"))?;
     let total = c.renditions.len();
     let page_r: Vec<&car::Rendition> = c.renditions.iter().skip(p.offset).take(p.limit).collect();
+    let mut coverage = Coverage::page(page_r.len() as u64, total as u64, p.offset as u64);
+    if c.tree_incomplete {
+        coverage.status = CoverageStatus::Partial;
+    }
     let mut by_format: BTreeMap<String, usize> = BTreeMap::new();
     for r in &c.renditions {
         *by_format.entry(r.pixel_format.clone().unwrap_or_else(|| "unknown".into())).or_insert(0) += 1;
@@ -992,23 +995,25 @@ fn apple_assets_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
         lims.push(Limitation::new("catalog_warnings", c.warnings.iter().take(20).cloned().collect::<Vec<_>>().join("; ")));
     }
     let summary = format!(
-        "{}: {} facet(s), {} rendition(s){}.",
+        "{}: {} facet(s), {} rendition(s){}.{}",
         inp.name,
         c.facets.len(),
         total,
-        c.header.as_ref().map(|h| format!(", schema {} storage {}", h.schema_version, h.storage_version)).unwrap_or_default()
+        c.header.as_ref().map(|h| format!(", schema {} storage {}", h.schema_version, h.storage_version)).unwrap_or_default(),
+        if c.tree_incomplete { " Some catalog tree entries could not be read." } else { "" }
     );
     let ev = builder(ctx, "apple_assets_list", inp.subject.clone(), json!({"path": inp.path, "offset": p.offset, "limit": p.limit}))
         .result(json!({
             "path": inp.path, "bom": c.bom, "header": c.header, "extended_metadata": c.extended_metadata,
             "key_format": c.key_format, "facets": c.facets, "appearances": c.appearances,
+            "tree_incomplete": c.tree_incomplete,
             "renditions_total": total, "renditions_by_pixel_format": by_format, "renditions": page_r,
         }))
         .summary(summary)
         .confidence(Confidence::Observed)
         .authority(Authority::OriginalFiles)
         .limitations(lims)
-        .coverage(Coverage::page(page_r.len() as u64, total as u64, p.offset as u64))
+        .coverage(coverage)
         .location(loc(&inp))
         .build()?;
     Ok(ToolOutput::evidence(ev))
