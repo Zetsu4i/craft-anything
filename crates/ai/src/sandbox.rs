@@ -20,8 +20,6 @@ use std::time::Duration;
 pub const REMOTE_CLI: &str = "/craft-anything/bin/craft-anything-cli";
 /// Marker of a completed setup, with the setup's version in it.
 const SETUP_MARKER: &str = "/craft-anything/.craft-setup-v1";
-/// The sandbox's Node install, when the template's Node is too old for the agent.
-const REMOTE_NODE_HOME: &str = "/craft-anything/node";
 /// Where the sandbox's ZCode agent lives (the agent bundle unpacks here).
 const REMOTE_AGENT: &str = "/craft-anything/agent";
 /// The app-side Linux CLI a release can carry for the sandbox, when one isn't bundled beside
@@ -189,6 +187,17 @@ impl Sandbox {
     pub fn sync_up(&self, project_root: &Path, status: &mut dyn FnMut(String), zcode: Option<&ZcodeSetup>) -> Result<SyncSummary, ToolError> {
         let envd = self.envd()?;
         let summary = e2b::sync_up(&envd, project_root, &self.remote_root, &self.config.ignore, &mut *status)?;
+        // Uploads land owned by root (the files API's); the agent runs as the sandbox's own user
+        // and has to edit its project, so its tree comes back to that user. The agent's own
+        // folders are pruned: they were set up for the right user already.
+        e2b::run_command(
+            &envd,
+            &format!(
+                "sudo find {} -path {}/node -prune -o -path {}/agent -prune -o -path {}/zcode -prune -o -exec chown \"$(id -un)\" {{}} +",
+                self.remote_root, self.remote_root, self.remote_root, self.remote_root,
+            ),
+            Duration::from_secs(300),
+        )?;
         self.setup(&envd, status, zcode)?;
         Ok(summary)
     }
@@ -245,14 +254,9 @@ impl Sandbox {
             // Node 22 for the ZCode agent, when the template's Node is older than it needs.
             e2b::run_command(
                 envd,
-                &format!(
-                    "if ! command -v node >/dev/null 2>&1 || [ \"$(node -p 'parseInt(process.versions.node)' 2>/dev/null || echo 0)\" -lt 22 ]; then \
-                      mkdir -p {REMOTE_NODE_HOME} && cd {REMOTE_NODE_HOME} && \
-                      curl -fsSL https://nodejs.org/dist/v22.20.0/node-v22.20.0-linux-x64.tar.xz -o node.tar.xz && \
-                      tar -xJf node.tar.xz --strip-components=1 && rm node.tar.xz && \
-                      ln -sf {REMOTE_NODE_HOME}/bin/node /usr/local/bin/node && ln -sf {REMOTE_NODE_HOME}/bin/npm /usr/local/bin/npm && ln -sf {REMOTE_NODE_HOME}/bin/npx /usr/local/bin/npx; \
-                    fi",
-                ),
+                "command -v node >/dev/null 2>&1 && [ \"$(node -p 'parseInt(process.versions.node)' 2>/dev/null || echo 0)\" -ge 22 ] || (                  curl -fsSL https://nodejs.org/dist/v22.20.0/node-v22.20.0-linux-x64.tar.xz -o /tmp/ca-node.tar.xz && \
+                  sudo mkdir -p /craft-anything/node && sudo tar -xJf /tmp/ca-node.tar.xz --strip-components=1 -C /craft-anything/node && rm /tmp/ca-node.tar.xz && \
+                  sudo ln -sf /craft-anything/node/bin/node /usr/local/bin/node && sudo ln -sf /craft-anything/node/bin/npm /usr/local/bin/npm && sudo ln -sf /craft-anything/node/bin/npx /usr/local/bin/npx)",
                 Duration::from_secs(600),
             )?;
         }
@@ -275,15 +279,15 @@ impl Sandbox {
         if let Some(cli) = sandbox_cli_path() {
             status("Uploading the tool server…".into());
             let bytes = std::fs::read(&cli).map_err(|e| ToolError::io(cli.display(), e))?;
-            e2b::run_command(envd, &format!("mkdir -p {}", parent_of(REMOTE_CLI)), Duration::from_secs(60))?;
+            e2b::run_command(envd, &format!("sudo mkdir -p {}", parent_of(REMOTE_CLI)), Duration::from_secs(60))?;
             envd.write_file(&format!("{REMOTE_CLI}.upload"), &bytes)?;
-            e2b::run_command(envd, &format!("mv {REMOTE_CLI}.upload {REMOTE_CLI} && chmod +x {REMOTE_CLI}"), Duration::from_secs(60))?;
+            e2b::run_command(envd, &format!("sudo mv {REMOTE_CLI}.upload {REMOTE_CLI} && sudo chmod +x {REMOTE_CLI}"), Duration::from_secs(60))?;
             return Ok(());
         }
         status("Fetching the tool server into the sandbox…".into());
         let url = std::env::var("CRAFT_ANYTHING_SANDBOX_CLI_URL").ok().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| DEFAULT_CLI_URL.to_string());
         let cmd = format!(
-            "mkdir -p {} && curl -fsSL '{url}' -o {REMOTE_CLI}.upload && mv {REMOTE_CLI}.upload {REMOTE_CLI} && chmod +x {REMOTE_CLI}",
+            "sudo mkdir -p {} && curl -fsSL '{url}' -o /tmp/ca-cli.upload && sudo mv /tmp/ca-cli.upload {REMOTE_CLI} && sudo chmod +x {REMOTE_CLI}",
             parent_of(REMOTE_CLI),
         );
         if e2b::run_command(envd, &cmd, Duration::from_secs(600)).is_err() {
@@ -315,9 +319,9 @@ impl Sandbox {
                     (dir.join("zai-bridge.cjs"), format!("{REMOTE_AGENT}/zai-bridge.cjs")),
                 ] {
                     let Ok(bytes) = std::fs::read(&src) else { continue };
-                    e2b::run_command(envd, &format!("mkdir -p {}", parent_of(&dest)), Duration::from_secs(60))?;
+                    e2b::run_command(envd, &format!("sudo mkdir -p {}", parent_of(&dest)), Duration::from_secs(60))?;
                     envd.write_file(&format!("{dest}.upload"), &bytes)?;
-                    e2b::run_command(envd, &format!("mv {dest}.upload {dest}"), Duration::from_secs(60))?;
+                    e2b::run_command(envd, &format!("sudo mv {dest}.upload {dest}"), Duration::from_secs(60))?;
                     uploaded = true;
                 }
                 // The agent's search tools from its own folder, when they are there.
@@ -336,7 +340,7 @@ impl Sandbox {
                 // common ones. Best effort: the agent runs without them, the build doesn't stop.
                 let _ = e2b::run_command(
                     envd,
-                    "command -v rg >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq ripgrep) || true",
+                    "command -v rg >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep) || true",
                     Duration::from_secs(600),
                 );
             }
@@ -347,7 +351,6 @@ impl Sandbox {
         if self.config.provide_zai_credentials
             && let Some(config) = z_ai_config_bytes()
         {
-            e2b::run_command(envd, "mkdir -p /etc", Duration::from_secs(60))?;
             envd.write_file("/etc/.z-ai-config", &config)?;
         }
         let route = if e2b::run_command(envd, "test -f /etc/.z-ai-config", Duration::from_secs(60)).is_ok() {
@@ -358,7 +361,11 @@ impl Sandbox {
             return Err(ToolError::new(ErrorCode::BadSettings, "The ZCode agent in the sandbox has no way to reach its GLM model.")
                 .with_remediation("Save a Z.ai API key for ZCode in Settings → AI, or allow the Z.ai credentials to travel in Settings → AI → Sandbox (\"Z.ai credentials in the sandbox\")."));
         };
-        e2b::run_command(envd, &format!("mkdir -p {REMOTE_AGENT}/config {}/zcode/home", self.remote_root), Duration::from_secs(60))?;
+        e2b::run_command(
+            envd,
+            &format!("sudo mkdir -p {REMOTE_AGENT}/config {}/zcode/home && sudo chown -R \"$(id -un)\" {}/zcode", self.remote_root, self.remote_root),
+            Duration::from_secs(60),
+        )?;
         envd.write_file(&format!("{REMOTE_AGENT}/provider_config.json"), crate::cli_agents::zcode::provider_config_for(&route).as_bytes())?;
         *self.zcode_model.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(route.model().to_string());
         // The bridge behind the free route: started once, kept by the sandbox, answered before
@@ -368,7 +375,7 @@ impl Sandbox {
             if !healthy {
                 status("Starting the sandbox's GLM bridge…".into());
                 let cmd = format!(
-                    "cd {REMOTE_AGENT} && (nohup node zai-bridge.cjs >> {REMOTE_AGENT}/bridge.log 2>&1 &) && \
+                    "sudo sh -c 'cd {REMOTE_AGENT} && nohup node zai-bridge.cjs >> {REMOTE_AGENT}/bridge.log 2>&1 &' && \
                      for i in $(seq 1 40); do curl -fsS http://127.0.0.1:3031/health >/dev/null 2>&1 && exit 0; sleep 1; done; \
                      echo 'the GLM bridge did not come up'; tail -5 {REMOTE_AGENT}/bridge.log 2>/dev/null; exit 1",
                 );
@@ -427,8 +434,8 @@ impl Sandbox {
         };
         let accept = if octet { " -H \"Accept: application/octet-stream\"" } else { "" };
         let cmd = format!(
-            "mkdir -p {REMOTE_AGENT}/config && curl -fsSL{auth}{accept} '{fetch_url}' -o /tmp/zcode-agent.tgz && \
-             tar -xzf /tmp/zcode-agent.tgz -C {REMOTE_AGENT} --strip-components=1 && rm /tmp/zcode-agent.tgz && \
+            "curl -fsSL{auth}{accept} '{fetch_url}' -o /tmp/zcode-agent.tgz && \
+             sudo mkdir -p {REMOTE_AGENT}/config && sudo tar -xzf /tmp/zcode-agent.tgz -C {REMOTE_AGENT} --strip-components=1 && rm /tmp/zcode-agent.tgz && \
              test -f {REMOTE_AGENT}/zcode.cjs",
         );
         if e2b::run_command(envd, &cmd, Duration::from_secs(600)).is_err() {
